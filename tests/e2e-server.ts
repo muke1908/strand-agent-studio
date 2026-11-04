@@ -8,7 +8,12 @@ const studio = await createServer({
   server: {
     host: "127.0.0.1",
     port: 4291,
-    proxy: { "/api": "http://127.0.0.1:4290" },
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:4290",
+        headers: { origin: "http://127.0.0.1:4290" },
+      },
+    },
   },
 });
 await studio.listen();

@@ -121,6 +121,84 @@ test("calendar policy coalesces missed occurrences and honors explicit time zone
   assert.equal(later.candidates[0].eventId, "2026-11-02T14:00:00.000Z");
 });
 
+test("five-minute schedules trigger once per interval, not at every policy check", async () => {
+  const settings = { expression: "*/5 * * * *", timeZone: "UTC" };
+  const baseline = await cronPolicy.evaluate(
+    settings,
+    undefined,
+    new Date("2026-11-03T17:01:00Z"),
+  );
+  assert.equal(baseline.candidates.length, 0);
+  const first = await cronPolicy.evaluate(
+    settings,
+    baseline.cursor,
+    new Date("2026-11-03T17:05:01Z"),
+  );
+  assert.equal(first.candidates[0].eventId, "2026-11-03T17:05:00.000Z");
+  const same = await cronPolicy.evaluate(
+    settings,
+    first.cursor,
+    new Date("2026-11-03T17:06:01Z"),
+  );
+  assert.equal(same.candidates.length, 0);
+  const next = await cronPolicy.evaluate(
+    settings,
+    same.cursor,
+    new Date("2026-11-03T17:10:01Z"),
+  );
+  assert.equal(next.candidates[0].eventId, "2026-11-03T17:10:00.000Z");
+});
+
+test("scheduled tool access defaults off and follows the latest saved opt-in", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  catalog.saveWorkflow(workflow());
+  catalog.saveWatch(registration);
+  const host = createRunHost(root, catalog, fixtureBackend());
+  let event = 0;
+  const policy: WatchPolicy = {
+    id: "change",
+    name: "Change",
+    description: "",
+    settingsSchema: { type: "object" },
+    async evaluate() {
+      return {
+        cursor: ++event,
+        candidates: [
+          {
+            eventId: String(event),
+            resourceId: "resource",
+            payload: { context: "Count PRs" },
+            reason: "Changed",
+          },
+        ],
+      };
+    },
+  };
+  try {
+    const watcher = createWatcher(root, catalog, host, [policy]);
+    for (const allowAllTools of [undefined, true, false]) {
+      if (allowAllTools !== undefined) {
+        const saved = catalog.watch(registration.id);
+        catalog.saveWatch({ ...saved.value, allowAllTools }, saved.revision);
+      }
+      const state = await watcher.evaluate(registration);
+      const run = await waitForRun(() =>
+        host.store.get(state.decisions.at(-1)!.runId!),
+      );
+      assert.equal(run.status, "completed", run.error);
+      assert.equal(run.allowAllTools, allowAllTools ?? false);
+      assert.equal(
+        host.store.snapshot(run.id).allowAllTools,
+        allowAllTools ?? false,
+      );
+    }
+  } finally {
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
 test("busy workflows queue only the latest change and apply the hourly admission budget", async () => {
   const root = temporaryRoot();
   const catalog = createCatalog(root);

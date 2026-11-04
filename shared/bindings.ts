@@ -1,4 +1,4 @@
-import type { Json, Reference, Workflow } from "./contracts.ts";
+import type { Json, LoopContext, Reference, Workflow } from "./contracts.ts";
 
 export function pointer(value: Json, path: string): Json {
   if (path === "") return value;
@@ -28,6 +28,7 @@ export function resolveReference(
   input: Json,
   outputs: Record<string, Json>,
   trigger?: Json,
+  loopContext?: LoopContext,
 ): Json {
   if (ref.source === "literal") return ref.value;
   if (ref.source === "input") return pointer(input, ref.pointer);
@@ -36,6 +37,16 @@ export function resolveReference(
       throw new Error("Trigger binding is unavailable in this context");
     return pointer(trigger, ref.pointer);
   }
+  if (ref.source === "loop") {
+    if (!loopContext) throw new Error("Loop feedback is unavailable here");
+    if (
+      loopContext.iteration === 1 &&
+      loopContext.feedback === null &&
+      ref.default !== undefined
+    )
+      return ref.default;
+    return pointer(loopContext, ref.pointer);
+  }
   const key = `${ref.stageId}/${ref.agentId}`;
   if (!Object.hasOwn(outputs, key))
     throw new Error(`Output unavailable: ${key}`);
@@ -43,11 +54,45 @@ export function resolveReference(
 }
 
 export function validateReferences(workflow: Workflow): void {
+  const ranges = workflow.stages.flatMap((stage, end) => {
+    if (!stage.loop) return [];
+    const start = workflow.stages.findIndex(
+      (item) => item.id === stage.loop!.targetStageId,
+    );
+    if (start < 0 || start > end)
+      throw new Error(
+        `Loop in ${stage.name} must target itself or an earlier stage`,
+      );
+    if (
+      !stage.agents.some((agent) => agent.id === stage.loop!.condition.agentId)
+    )
+      throw new Error(
+        `Loop in ${stage.name} must select an agent from that stage`,
+      );
+    const { pointer: path, operator, value } = stage.loop.condition;
+    validatePointer(path);
+    if (
+      operator !== "equals" &&
+      operator !== "notEquals" &&
+      typeof value !== "number"
+    )
+      throw new Error(
+        `Numeric loop comparison in ${stage.name} needs a number`,
+      );
+    return [{ start, end }];
+  });
+  for (let index = 1; index < ranges.length; index++)
+    if (ranges[index].start <= ranges[index - 1].end)
+      throw new Error("Loop ranges must not overlap or nest");
   const available = new Set<string>();
-  for (const stage of workflow.stages) {
+  for (const [index, stage] of workflow.stages.entries()) {
     if (available.has(`stage:${stage.id}`))
       throw new Error(`Duplicate stage: ${stage.id}`);
-    for (const ref of Object.values(stage.inputs)) validate(ref, available);
+    const inLoop = ranges.some(
+      ({ start, end }) => start <= index && index <= end,
+    );
+    for (const ref of Object.values(stage.inputs))
+      validate(ref, available, inLoop);
     const agents = new Set<string>();
     for (const agent of stage.agents) {
       if (agents.has(agent.id))
@@ -56,22 +101,29 @@ export function validateReferences(workflow: Workflow): void {
     }
     available.add(`stage:${stage.id}`);
     for (const agent of stage.agents) available.add(`${stage.id}/${agent.id}`);
+    for (const ref of Object.values(stage.loop?.feedback ?? {}))
+      validate(ref, available, inLoop);
   }
   if (workflow.result) validate(workflow.result, available);
 }
 
-function validate(ref: Reference, available: Set<string>): void {
+function validatePointer(path: string): void {
+  if (path !== "" && (!path.startsWith("/") || /~(?![01])/u.test(path)))
+    throw new Error(`Invalid JSON Pointer: ${path}`);
+}
+
+function validate(
+  ref: Reference,
+  available: Set<string>,
+  inLoop = false,
+): void {
   if (ref.source === "trigger")
     throw new Error(
       "Workflow bindings cannot reference watcher triggers directly",
     );
-  if (
-    ref.source !== "literal" &&
-    ref.pointer !== "" &&
-    (!ref.pointer.startsWith("/") || /~(?![01])/u.test(ref.pointer))
-  ) {
-    throw new Error(`Invalid JSON Pointer: ${ref.pointer}`);
-  }
+  if (ref.source !== "literal") validatePointer(ref.pointer);
+  if (ref.source === "loop" && !inLoop)
+    throw new Error("Loop feedback bindings must be inside a loop range");
   if (
     ref.source === "stage" &&
     !available.has(`${ref.stageId}/${ref.agentId}`)

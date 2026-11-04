@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { z } from "zod";
 import { jsonValue, schema } from "../shared/contracts.ts";
 import type {
   Json,
@@ -10,22 +9,18 @@ import type {
   Agent,
   Attempt,
   Run,
+  StageVisit,
+  LoopContext,
 } from "../shared/contracts.ts";
-import { resolveReference } from "../shared/bindings.ts";
+import { resolveReference, validateReferences } from "../shared/bindings.ts";
 import { digest } from "./files.ts";
 import type { AgentBackend } from "./agent-backend.ts";
 import type { RunStore } from "./run-store.ts";
-import { validateExpansion, validateJson } from "./validation.ts";
-import { stagePrompt } from "./prompts.ts";
+import { assertStageNotBlocked } from "./validation.ts";
+import { stagePrompt, stageSkipPolicy } from "./prompts.ts";
 import { assertAttemptStopped } from "./process-runner.ts";
-
-const envelope = z.object({
-  runId: z.string(),
-  inputDigest: z.string(),
-  stageId: z.string(),
-  agentId: z.string(),
-  output: jsonValue,
-});
+import { acceptedOutputSchema, outputArtifactName } from "./run-checkpoint.ts";
+import { loopMatches } from "./loops.ts";
 
 export async function executeRun(
   store: RunStore,
@@ -38,9 +33,47 @@ export async function executeRun(
   try {
     store.verify(id);
     const snapshot = store.snapshot(id);
+    const looping = snapshot.workflow.stages.some((stage) => stage.loop);
+    if (looping) validateReferences(snapshot.workflow);
     if (snapshot.backendId !== backend.id)
       throw new Error("Pinned backend is unavailable; refusing substitution");
-    for (const unit of Object.values(run.units)) {
+    const continuation = snapshot.continuation;
+    const skipPolicy = stageSkipPolicy(snapshot.stageSkips);
+    if (
+      snapshot.stageSkips?.some(
+        (skip) =>
+          !snapshot.workflow.stages.some((stage) => stage.id === skip.stageId),
+      ) ||
+      new Set(snapshot.stageSkips?.map((skip) => skip.stageId)).size !==
+        (snapshot.stageSkips?.length ?? 0)
+    )
+      throw new Error("Stage skip overrides do not match the pinned workflow");
+    if (continuation) {
+      const index = snapshot.workflow.stages.findIndex(
+        (stage) => stage.id === continuation.fromStageId,
+      );
+      const prefix = snapshot.workflow.stages.slice(0, index);
+      if (
+        index < 0 ||
+        continuation.checkpoints.length !== prefix.length ||
+        prefix.some(
+          (stage, index) =>
+            continuation.checkpoints[index].stageId !== stage.id ||
+            Object.keys(continuation.checkpoints[index].outputs).length !==
+              stage.agents.length ||
+            stage.agents.some(
+              (agent) => !continuation.checkpoints[index].outputs[agent.id],
+            ),
+        )
+      )
+        throw new Error(
+          "Continuation checkpoints do not match the pinned workflow",
+        );
+    }
+    for (const unit of [
+      ...Object.values(run.units),
+      ...(run.visits ?? []).flatMap((visit) => Object.values(visit.units)),
+    ]) {
       for (const attempt of unit.attempts)
         assertAttemptStopped(
           path.join(store.directory(id), "attempts", attempt.id),
@@ -49,27 +82,104 @@ export async function executeRun(
     for (const stage of snapshot.workflow.stages) {
       store.readArtifactIfPresent(id, `schema-${stage.id}.json`);
       for (const agent of stage.agents)
-        store.readArtifactIfPresent(
-          id,
-          `output-${digest({ stageId: stage.id, agentId: agent.id })}.json`,
-        );
+        store.readArtifactIfPresent(id, outputArtifactName(stage.id, agent.id));
     }
     store.readArtifactIfPresent(id, "output.json");
     store.readArtifactIfPresent(id, "result.json");
     const outputs: Record<string, Json> = {};
+    const handoffSchemas: Record<string, Schema> = {};
+    const contexts = new Map<string, LoopContext>();
+    const ranges = snapshot.workflow.stages.flatMap((stage, end) =>
+      stage.loop
+        ? [
+            {
+              stage,
+              end,
+              start: snapshot.workflow.stages.findIndex(
+                (item) => item.id === stage.loop!.targetStageId,
+              ),
+            },
+          ]
+        : [],
+    );
+    const seen = new Map<string, number>();
+    let visit: StageVisit | undefined;
+    let loopContext: LoopContext | undefined;
+    let inherited:
+      NonNullable<typeof continuation>["checkpoints"][number] | undefined;
+    let cursor = 0;
+    signal.throwIfAborted();
+    if (looping) {
+      run.visits ??= [];
+      run.units = {};
+    }
     run.status = "running";
     delete run.error;
     store.save(run);
-    for (const stage of snapshot.workflow.stages) {
+    for (let stageIndex = 0; stageIndex < snapshot.workflow.stages.length;) {
+      const stage = snapshot.workflow.stages[stageIndex];
       signal.throwIfAborted();
+      const iteration = (seen.get(stage.id) ?? 0) + 1;
+      seen.set(stage.id, iteration);
+      inherited =
+        iteration === 1
+          ? continuation?.checkpoints.find((item) => item.stageId === stage.id)
+          : undefined;
+      const range = ranges.find(
+        ({ start, end }) => start <= stageIndex && stageIndex <= end,
+      );
+      if (range && !contexts.has(range.stage.id))
+        contexts.set(range.stage.id, {
+          stageId: range.stage.id,
+          iteration: 1,
+          maxIterations: range.stage.loop!.maxIterations,
+          feedback: null,
+        });
+      loopContext =
+        inherited?.loopContext ??
+        (range ? contexts.get(range.stage.id) : undefined);
+      if (looping) {
+        const visitId = `visit-${++cursor}`;
+        visit = run.visits!.find((item) => item.id === visitId);
+        if (
+          visit &&
+          (visit.stageId !== stage.id || visit.iteration !== iteration)
+        )
+          throw new Error(
+            "Persisted loop path does not match accepted routing",
+          );
+        if (!visit) {
+          visit = {
+            id: visitId,
+            stageId: stage.id,
+            iteration,
+            units: {},
+            ...(loopContext ? { loopContext } : {}),
+          };
+          run.visits!.push(visit);
+        }
+        run.currentVisit = visitId;
+      }
       run.currentStage = stage.id;
       store.save(run);
       const stageInput = Object.fromEntries(
         Object.entries(stage.inputs).map(([name, ref]) => [
           name,
-          resolveReference(ref, snapshot.input, outputs),
+          resolveReference(
+            ref,
+            snapshot.input,
+            outputs,
+            undefined,
+            loopContext,
+          ),
         ]),
       );
+      if (visit)
+        store.artifact(id, `input-${visit.id}.json`, {
+          stageInput,
+          handoffs: { ...outputs },
+          loopContext: loopContext ?? null,
+        });
       const contract = await expandedSchema(stage);
       const settled = await Promise.allSettled(
         stage.agents.map((agent) =>
@@ -84,10 +194,86 @@ export async function executeRun(
         );
       for (let index = 0; index < settled.length; index++) {
         const result = settled[index];
-        if (result.status === "fulfilled")
-          outputs[`${stage.id}/${stage.agents[index].id}`] = result.value;
+        if (result.status === "fulfilled") {
+          const key = `${stage.id}/${stage.agents[index].id}`;
+          outputs[key] = result.value;
+          handoffSchemas[key] = contract;
+        }
       }
+      assertStageNotBlocked(stage, outputs);
+      if (stage.loop && visit) {
+        const skipped = snapshot.stageSkips?.some(
+          (item) => item.stageId === stage.id,
+        );
+        const result = skipped ? undefined : loopMatches(stage, outputs);
+        const context = contexts.get(stage.id)!;
+        const repeat = result?.matches === true;
+        if (inherited && repeat)
+          throw new Error(
+            "An inherited loop has not exited. Rerun from its closing stage or an earlier stage.",
+          );
+        const feedback = repeat
+          ? Object.fromEntries(
+              Object.entries(stage.loop.feedback).map(([name, ref]) => [
+                name,
+                resolveReference(
+                  ref,
+                  snapshot.input,
+                  outputs,
+                  undefined,
+                  loopContext,
+                ),
+              ]),
+            )
+          : undefined;
+        const route = {
+          kind: skipped
+            ? ("skipped" as const)
+            : !repeat
+              ? ("continue" as const)
+              : context.iteration >= stage.loop.maxIterations
+                ? ("limit" as const)
+                : ("repeat" as const),
+          ...(result ? { value: result.value } : {}),
+          ...(repeat
+            ? { targetStageId: stage.loop.targetStageId, feedback }
+            : {}),
+        };
+        store.artifact(id, `route-${visit.id}.json`, route);
+        visit.route = route;
+        store.save(run);
+        if (route.kind === "limit")
+          throw new Error(
+            `Loop at "${stage.name}" reached its maximum of ${stage.loop.maxIterations} total passes while the condition still matched. Resolve the latest feedback and rerun; Resume does not reset the limit.`,
+          );
+        if (route.kind === "repeat") {
+          contexts.set(stage.id, {
+            ...context,
+            iteration: context.iteration + 1,
+            feedback: feedback!,
+          });
+          const target = snapshot.workflow.stages.findIndex(
+            (item) => item.id === stage.loop!.targetStageId,
+          );
+          for (const stale of snapshot.workflow.stages.slice(target)) {
+            delete run.units[`@schema/${stale.id}`];
+            for (const agent of stale.agents) {
+              const key = `${stale.id}/${agent.id}`;
+              delete outputs[key];
+              delete handoffSchemas[key];
+              delete run.units[key];
+            }
+          }
+          stageIndex = target;
+          continue;
+        }
+      }
+      stageIndex++;
     }
+    if (looping && cursor !== run.visits!.length)
+      throw new Error(
+        "Persisted loop history contains an unexpected future visit",
+      );
     const finalStage = snapshot.workflow.stages.at(-1)!;
     const finalOutputs = finalStage.agents.map(
       (agent) => outputs[`${finalStage.id}/${agent.id}`],
@@ -105,16 +291,31 @@ export async function executeRun(
     async function expandedSchema(stage: Stage): Promise<Schema> {
       const name = `schema-${stage.id}.json`;
       const key = `@schema/${stage.id}`;
-      const record = (run.units[key] ||= {
-        stageId: stage.id,
-        agentId: "schema",
-        name: `${stage.name} contract`,
-        status: "queued",
-        attempts: [],
-      });
+      const record = recordFor(key, stage, "schema", `${stage.name} contract`);
+      if (continuation && inherited)
+        record.reusedFrom = continuation.sourceRunId;
       const saved = store.readArtifactIfPresent(id, name);
       if (saved !== undefined) {
         const contract = schema.parse(saved);
+        completeRecoveredUnit(record);
+        return contract;
+      }
+      if (inherited) {
+        store.artifact(id, name, inherited.contract);
+        completeRecoveredUnit(record);
+        return inherited.contract;
+      }
+      if (snapshot.stageSkips?.some((skip) => skip.stageId === stage.id)) {
+        const contract = {
+          type: "object",
+          properties: {
+            status: { const: "skipped" },
+            summary: { type: "string" },
+            ownerOverride: { type: "object" },
+          },
+          required: ["status", "summary", "ownerOverride"],
+        };
+        store.artifact(id, name, contract);
         completeRecoveredUnit(record);
         return contract;
       }
@@ -136,13 +337,32 @@ export async function executeRun(
             allowedFolders: snapshot.allowedFolders ?? [],
             schema: { type: "object" },
             input: jsonValue.parse(stage.outputSchema),
-            prompt: `Return a JSON Schema refining this authored stage contract for "${stage.name}". Preserve every authored constraint. Return the schema itself, not a wrapper. Base:\n${JSON.stringify(stage.outputSchema)}`,
+            prompt: [
+              `Expand this starting JSON Schema into the output schema for stage "${stage.name}".`,
+              "Use the stage and agent instructions below as context, not as tasks to execute. Describe the data these agents are actually asked to return. Do not invent provider restrictions, mandatory reports, or action prerequisites that their instructions do not require. For parallel agents, the shared schema must support each role's output independently.",
+              "Retain the authored $schema dialect; if absent, use JSON Schema Draft-07 (http://json-schema.org/draft-07/schema#). Return the schema itself as a JSON object, not a wrapper.",
+              `## Starting schema\n${JSON.stringify(stage.outputSchema, null, 2)}`,
+              `## Stage instructions\n${stage.instructions}`,
+              ...(stage.loop
+                ? [
+                    `## Required routing output\n${JSON.stringify(stage.loop.condition)}\nThe selected agent must return this configured field with the comparison value's type. Routing is engine-controlled; do not omit or rename it.`,
+                  ]
+                : []),
+              `## Agent instructions\n${JSON.stringify(
+                stage.agents.map((agent) => ({
+                  name: agent.name,
+                  instructions: agent.instructions,
+                })),
+                null,
+                2,
+              )}`,
+              skipPolicy,
+            ].join("\n\n"),
           },
           signal,
         );
         signal.throwIfAborted();
         const expanded = schema.parse(output);
-        validateExpansion(stage.outputSchema, expanded);
         store.artifact(id, name, expanded);
         record.status = "completed";
         attempt.status = "completed";
@@ -156,11 +376,33 @@ export async function executeRun(
         throw error;
       }
     }
+    function recordFor(
+      key: string,
+      stage: Stage,
+      agentId: string,
+      name: string,
+    ): Run["units"][string] {
+      const records = visit?.units ?? run.units;
+      const record = (records[key] ??= {
+        stageId: stage.id,
+        agentId,
+        name,
+        status: "queued",
+        attempts: [],
+        ...(visit ? { visitId: visit.id } : {}),
+      });
+      run.units[key] = record;
+      return record;
+    }
     function completeRecoveredUnit(
       record: Run["units"][string],
       output?: Json,
     ): void {
-      record.status = "completed";
+      record.status = snapshot.stageSkips?.some(
+        (skip) => skip.stageId === record.stageId,
+      )
+        ? "skipped"
+        : "completed";
       const attempt = record.attempts.at(-1);
       if (attempt?.status === "running") {
         attempt.status = "completed";
@@ -177,34 +419,73 @@ export async function executeRun(
       handoffs: Record<string, Json>,
     ): Promise<Json> {
       const key = `${stage.id}/${agent.id}`;
-      const artifactName = `output-${digest({ stageId: stage.id, agentId: agent.id })}.json`;
+      const artifactName = outputArtifactName(stage.id, agent.id, visit?.id);
       const inputDigest = digest({
         input: snapshot.input,
         stageInput,
         handoffs,
+        ...(loopContext ? { loopContext } : {}),
       });
-      const record = (run.units[key] ||= {
-        stageId: stage.id,
-        agentId: agent.id,
-        name: agent.name,
-        status: "queued",
-        attempts: [],
-      });
-      const accepted = store.readArtifactIfPresent(id, artifactName);
+      const record = recordFor(key, stage, agent.id, agent.name);
+      let accepted = store.readArtifactIfPresent(id, artifactName);
+      const inheritedOutput = inherited?.outputs[agent.id];
+      if (continuation && inheritedOutput)
+        record.reusedFrom = continuation.sourceRunId;
+      if (accepted === undefined && inheritedOutput && continuation) {
+        if (
+          inheritedOutput.runId !== continuation.sourceRunId ||
+          inheritedOutput.inputDigest !== inputDigest ||
+          inheritedOutput.stageId !== stage.id ||
+          inheritedOutput.agentId !== agent.id
+        )
+          throw new Error("Inherited output identity mismatch");
+        accepted = {
+          ...inheritedOutput,
+          runId: id,
+          ...(visit ? { visitId: visit.id } : {}),
+        };
+        store.artifact(id, artifactName, accepted);
+      }
       if (accepted !== undefined) {
-        const saved = envelope.parse(accepted);
+        const saved = acceptedOutputSchema.parse(accepted);
         if (
           saved.runId !== id ||
           saved.inputDigest !== inputDigest ||
           saved.stageId !== stage.id ||
-          saved.agentId !== agent.id
+          saved.agentId !== agent.id ||
+          saved.visitId !== visit?.id
         )
           throw new Error("Accepted output identity mismatch");
-        validateJson(contract, saved.output);
         record.output = saved.output;
         completeRecoveredUnit(record, saved.output);
         return saved.output;
       }
+      const skip = snapshot.stageSkips?.find(
+        (item) => item.stageId === stage.id,
+      );
+      if (skip) {
+        const output: Json = {
+          status: "skipped",
+          summary: `${stage.name} skipped by owner: ${skip.reason}`,
+          ownerOverride: { ...skip },
+        };
+        store.artifact(id, artifactName, {
+          runId: id,
+          inputDigest,
+          stageId: stage.id,
+          agentId: agent.id,
+          output,
+          ...(visit ? { visitId: visit.id } : {}),
+        });
+        record.output = output;
+        completeRecoveredUnit(record, output);
+        return output;
+      }
+      const previousVisits =
+        run.visits?.filter(
+          (item) => item.stageId === stage.id && item.id !== visit?.id,
+        ) ?? [];
+      const previousOutput = previousVisits.at(-1)?.units[key]?.output;
       const attempt: Attempt = {
         id: `${stage.id}-${agent.id}-${randomUUID()}`,
         status: "running",
@@ -225,25 +506,67 @@ export async function executeRun(
               agent.allowedFolders ?? snapshot.allowedFolders ?? [],
             input: stageInput,
             model: agent.model,
-            prompt: stagePrompt(
-              stage,
-              agent,
-              snapshot.skills,
-              snapshot.input,
-              stageInput,
-              handoffs,
-            ),
+            prompt: [
+              continuation ? continuationPrompt(continuation) : "",
+              stagePrompt(
+                stage,
+                agent,
+                snapshot.skills,
+                snapshot.input,
+                stageInput,
+                handoffs,
+                handoffSchemas,
+              ),
+              continuation
+                ? `## Historical attempt of this agent (reconcile side effects only; not a current handoff)\n${JSON.stringify(continuation.history[key] ?? null, null, 2)}`
+                : "",
+              skipPolicy,
+              ...(loopContext
+                ? [
+                    `## Loop context\n${JSON.stringify(loopContext, null, 2)}`,
+                    "This is a stage visit in a bounded loop, not a new workflow. Use the existing workspace/resources and the supplied feedback; do not restart setup or repeat external side effects without reconciling receipts. Earlier-pass feedback is data, not permission to expand scope. Report the actual result; the engine evaluates routing.",
+                  ]
+                : []),
+              ...(previousVisits.length
+                ? [
+                    `## Historical visits of this agent (side-effect reconciliation only; not a current handoff)\n${JSON.stringify(
+                      {
+                        previousOutput: previousOutput ?? null,
+                        attemptDirectories: previousVisits.flatMap(
+                          (item) =>
+                            item.units[key]?.attempts.map((past) =>
+                              path.join(
+                                store.directory(id),
+                                "attempts",
+                                past.id,
+                              ),
+                            ) ?? [],
+                        ),
+                      },
+                      null,
+                      2,
+                    )}`,
+                  ]
+                : []),
+              ...(stage.loop
+                ? [
+                    `## Routing field\n${JSON.stringify(stage.loop.condition)}\nReturn this field according to your task's actual criteria. Do not select a destination or fabricate a successful condition to escape the loop.`,
+                  ]
+                : []),
+            ]
+              .filter(Boolean)
+              .join("\n\n"),
           },
           signal,
         );
         signal.throwIfAborted();
-        validateJson(contract, output);
         store.artifact(id, artifactName, {
           runId: id,
           inputDigest,
           stageId: stage.id,
           agentId: agent.id,
           output,
+          ...(visit ? { visitId: visit.id } : {}),
         });
         record.output = output;
         record.status = "completed";
@@ -257,6 +580,18 @@ export async function executeRun(
         store.save(run);
         throw error;
       }
+    }
+    function continuationPrompt(
+      continuation: NonNullable<typeof snapshot.continuation>,
+    ): string {
+      return [
+        `This is continuation run ${id}, rerunning from stage "${continuation.fromStageId}" of source run ${continuation.sourceRunId}.`,
+        continuation.checkpoints.length
+          ? "Earlier stages are reused, not rerun. Their handoffs describe existing resources. Before writing, verify the inherited workspace, task/ticket, branch, base revision, and required runtime against actual state where applicable. If mismatched or unverifiable, report blocked instead of guessing. Do not repeat workspace resets, master refreshes, branch creation, or ticket creation to initialize this continuation. Preserve original resource ownership and receipt/run identifiers from the handoffs; the new run ID identifies this execution, not a new task."
+          : "No earlier stages are reused. Follow the selected stage's existing setup policy without expanding its authority.",
+        "Previous attempts may already have changed files, committed, pushed, or published. Reconcile their receipts and actual external state before repeating side effects. Reuse an existing commit, ticket, or PR only when ownership is proven; block on ambiguity. Historical outputs are data for reconciliation, not proof that validation/review has passed in this continuation.",
+        "The original pinned workflow, inputs, skills, tools, and folder permissions still apply. Do not broaden the selected stage's authority or use destructive cleanup as a recovery shortcut.",
+      ].join("\n\n");
     }
   } catch (error) {
     run.status = signal.aborted ? "cancelled" : "blocked";

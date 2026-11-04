@@ -7,6 +7,7 @@ import {
   Sparkles,
   Settings2,
   BookOpen,
+  PanelsTopLeft,
 } from "lucide-react";
 import { Overview } from "./pages/overview.tsx";
 import { Workflows } from "./pages/workflows.tsx";
@@ -16,6 +17,7 @@ import { Runs, RunDetail } from "./pages/runs.tsx";
 import { Skills } from "./pages/skills.tsx";
 import { Watches } from "./pages/watches.tsx";
 import { Settings } from "./pages/settings.tsx";
+import { WatchDashboard } from "./pages/watch-dashboard.tsx";
 
 const links = [
   { to: "/", label: "Overview", icon: LayoutGrid },
@@ -23,6 +25,7 @@ const links = [
   { to: "/skills", label: "Skills", icon: BookOpen },
   { to: "/runs", label: "Runs", icon: Blocks },
   { to: "/watches", label: "Watches", icon: Radio },
+  { to: "/dashboard", label: "Dashboard", icon: PanelsTopLeft },
   { to: "/settings", label: "Settings", icon: Settings2 },
 ];
 export function App() {
@@ -60,6 +63,7 @@ export function App() {
           <Route path="/runs/:id" element={<RunDetail />} />
           <Route path="/skills" element={<Skills />} />
           <Route path="/watches" element={<Watches />} />
+          <Route path="/dashboard" element={<WatchDashboard />} />
           <Route path="/settings" element={<Settings />} />
           <Route
             path="*"

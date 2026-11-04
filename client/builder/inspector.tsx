@@ -8,6 +8,8 @@ import {
 import type { Agent, Skill, Stage, Workflow } from "../../shared/contracts.ts";
 import { JsonEditor } from "../components.tsx";
 import { AgentFolders } from "./agent-folders.tsx";
+import { AgentInstructions } from "./agent-instructions.tsx";
+import { StageLoop } from "./stage-loop.tsx";
 
 export type Selection =
   | { kind: "workflow" }
@@ -143,16 +145,11 @@ export function Inspector({
                 }
               />
             </label>
-            <label className="field">
-              Agent instructions
-              <textarea
-                rows={5}
-                value={agent.instructions}
-                onChange={(event) =>
-                  updateAgent({ ...agent, instructions: event.target.value })
-                }
-              />
-            </label>
+            <AgentInstructions
+              key={`instructions-${stage?.id}/${agent.id}`}
+              agent={agent}
+              onChange={updateAgent}
+            />
             <AgentFolders
               key={`${stage?.id}/${agent.id}`}
               folders={agent.allowedFolders ?? []}
@@ -194,6 +191,13 @@ export function Inspector({
                   }
                 />
               </label>
+              <StageLoop
+                key={stage.id}
+                stage={stage}
+                workflow={workflow}
+                update={updateStage}
+                error={error}
+              />
               <label className="field">
                 Stage instructions
                 <textarea

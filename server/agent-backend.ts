@@ -9,7 +9,7 @@ export type AgentRequest = {
   directory: string;
   prompt: string;
   schema: Schema;
-  purpose: "schema" | "stage";
+  purpose: "schema" | "stage" | "summary";
   input: Json;
   model?: string;
   allowAllTools?: boolean;
@@ -133,13 +133,21 @@ export function copilotBackend(): AgentBackend {
           : "\nDo not write outside this attempt directory. Do not publish, delegate, or modify source.";
       fs.writeFileSync(
         promptFile,
-        `${request.prompt}${folderInstructions}\n\nWrite JSON matching this schema to ${outputFile}:\n${JSON.stringify(request.schema)}${restrictions}`,
+        [
+          "## Required output artifact",
+          `Output file: ${outputFile}`,
+          "Before finishing, write your result to this exact file as JSON matching the schema below. For blocked tasks, still write a schema-compliant result using only supported fields and status values.",
+          "A final chat response or a separate audit receipt does not satisfy this contract.",
+          `${folderInstructions}${restrictions}`,
+          `## Required output schema\n${JSON.stringify(request.schema, null, 2)}`,
+          `## Task\n${request.prompt}`,
+        ].join("\n\n"),
         { mode: 0o600 },
       );
       const args = [
         ...prefix,
         "--prompt",
-        `Read and execute ${promptFile}.`,
+        `Read and execute ${promptFile}. Before finishing, write the required JSON result to ${outputFile}, following the schema at the start of the task file. Do not return the result only in chat.`,
         "--no-ask-user",
         ...(options.has("--trust-folder") ? ["--trust-folder"] : []),
         "--no-custom-instructions",
@@ -168,7 +176,17 @@ export function copilotBackend(): AgentBackend {
 }
 
 function readOutput(file: string): Json {
-  const stat = fs.lstatSync(file);
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(file);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT")
+      throw new Error(
+        `Copilot CLI exited successfully without writing the required output artifact: ${file}. A final chat response is not a result file. Inspect ${path.join(path.dirname(file), "stdout.log")} and ${path.join(path.dirname(file), "stderr.log")} for the agent's outcome.`,
+        { cause: error },
+      );
+    throw error;
+  }
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4 * 1024 * 1024)
     throw new Error("Agent output must be a regular JSON file under 4 MiB");
   return JSON.parse(fs.readFileSync(file, "utf8"));

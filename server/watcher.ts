@@ -160,11 +160,17 @@ export function createWatcher(
       )
         continue;
       try {
-        const run = host.launch(watch.workflowId, decision.input, requestId, {
-          watchId: watch.id,
-          eventId: decision.eventId,
-          reason: decision.reason,
-        });
+        const run = host.launch(
+          watch.workflowId,
+          decision.input,
+          requestId,
+          {
+            watchId: watch.id,
+            eventId: decision.eventId,
+            reason: decision.reason,
+          },
+          watch.allowAllTools ?? false,
+        );
         decision.status = "launched";
         decision.runId = run.id;
         runs.push(run);

@@ -1,10 +1,648 @@
-import { test, expect } from "@playwright/test";
+import { test as base, expect } from "@playwright/test";
+import type { Page } from "@playwright/test";
 import fs from "node:fs";
 import path from "node:path";
+import { unzipSync, strFromU8 } from "fflate";
 import { temporaryRoot, workflow } from "../helpers.ts";
+
+const test = base.extend<{ instructionFile: string }>({
+  instructionFile: async ({ browserName }, use) => {
+    const root = temporaryRoot();
+    const file = path.join(fs.realpathSync(root), `agent-${browserName}.md`);
+    fs.writeFileSync(
+      file,
+      "# Agent\nCross-check claims against supplied evidence.",
+    );
+    try {
+      await use(file);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+});
+
+async function chooseInstructionFile(page: Page, file: string) {
+  await page.getByRole("button", { name: "Choose Markdown file" }).click();
+  const picker = page.getByRole("dialog", { name: "Choose Markdown file" });
+  await expect(
+    picker.getByRole("button", { name: "Parent directory" }),
+  ).toBeVisible();
+  await picker
+    .getByLabel("Directory", { exact: true })
+    .fill(path.dirname(file));
+  await picker
+    .getByRole("button", { name: "Open directory", exact: true })
+    .click();
+  await picker
+    .getByRole("button", { name: path.basename(file), exact: true })
+    .click();
+}
+
+test("configure a generic conditional loop and inspect immutable pass history and feedback", async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const definition = workflow(`loop-${crypto.randomUUID().slice(0, 8)}`);
+  definition.stages[0].agents = [definition.stages[0].agents[0]];
+  definition.stages[1].outputSchema.properties = {
+    summary: { type: "string" },
+    count: { type: "number" },
+  };
+  definition.stages.push({
+    ...definition.stages[1],
+    id: "finish",
+    name: "Finish",
+    inputs: {
+      evidence: {
+        source: "stage",
+        stageId: "report",
+        agentId: "writer",
+        pointer: "/summary",
+      },
+    },
+  });
+  await expect(
+    await page.request.put(`/api/pipelines/${definition.id}`, {
+      data: { value: definition },
+    }),
+  ).toBeOK();
+  await page.goto(`/pipelines/${definition.id}`);
+  await page.getByRole("button", { name: "02 Report", exact: true }).click();
+  await page
+    .getByRole("checkbox", {
+      name: "Repeat earlier stages when a condition matches",
+    })
+    .check();
+  await page
+    .getByRole("combobox", { name: "Repeat from stage", exact: true })
+    .selectOption("discover");
+  await page
+    .getByRole("combobox", { name: "Read output from", exact: true })
+    .selectOption("writer");
+  await page
+    .getByRole("combobox", { name: "Output field", exact: true })
+    .selectOption("/count");
+  await page
+    .getByRole("combobox", { name: "Comparison", exact: true })
+    .selectOption("lessThan");
+  await page
+    .getByRole("textbox", { name: "Comparison value", exact: true })
+    .fill("{");
+  await expect(page.getByRole("alert")).toBeVisible();
+  await page
+    .getByRole("textbox", { name: "Comparison value", exact: true })
+    .fill("2");
+  await page.getByLabel("Maximum total passes", { exact: true }).fill("2");
+  const preview = page.getByRole("region", { name: "Loop preview" });
+  await expect(preview).toContainText("If count is less than 2");
+  await expect(preview.getByRole("listitem")).toHaveText([
+    "Discover",
+    "Report",
+  ]);
+  await expect(preview).toContainText("Continue to Finish");
+  await expect(preview).toContainText("Still matches on pass 2?");
+  await expect(
+    page.getByRole("textbox", { name: "Loop feedback bindings", exact: true }),
+  ).not.toBeVisible();
+  await page.getByText("Feedback & advanced settings", { exact: true }).click();
+  await page
+    .getByRole("textbox", { name: "Loop feedback bindings", exact: true })
+    .fill(
+      JSON.stringify({
+        notes: {
+          source: "stage",
+          stageId: "report",
+          agentId: "writer",
+          pointer: "/summary",
+        },
+      }),
+    );
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(
+    page.getByText("All changes saved", { exact: false }),
+  ).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "02 Report", exact: true }).click();
+  await expect(
+    page.getByLabel("Maximum total passes", { exact: true }),
+  ).toHaveValue("2");
+  await expect(
+    page.getByRole("combobox", { name: "Output field", exact: true }),
+  ).toHaveValue("/count");
+  await page.getByRole("button", { name: "Close inspector" }).click();
+  await expect(
+    page.getByText("Repeat: back to Discover", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("Otherwise", { exact: true })).toBeVisible();
+  const launched = await page.request.post(
+    `/api/pipelines/${definition.id}/runs`,
+    {
+      data: {
+        input: { context: "Synthetic loop; no external actions." },
+        requestId: crypto.randomUUID(),
+      },
+    },
+  );
+  await expect(launched).toBeOK();
+  const { id } = await launched.json();
+  await page.goto(`/runs/${id}`);
+  await expect(page.getByRole("alert")).toContainText(
+    "maximum of 2 total passes",
+  );
+  const history = page.getByLabel("Report pass history", { exact: true });
+  await expect(
+    history.getByText("Pass 1 of up to 2 — Repeat from Discover", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    history.getByText("Pass 2 of up to 2 — Pass limit reached; blocked", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await history
+    .getByText("Pass 1 of up to 2 — Repeat from Discover", { exact: true })
+    .click();
+  await expect(history.getByText(/"kind": "repeat"/)).toBeVisible();
+  const firstHistory = page.getByLabel("Discover pass history", {
+    exact: true,
+  });
+  await firstHistory.getByText("Pass 1 of up to 2", { exact: true }).click();
+  await firstHistory
+    .getByRole("button", { name: "View Alpha pass 1 (completed)", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", { name: "Alpha", exact: true });
+  await expect(
+    dialog.getByRole("heading", { name: "Input", exact: true }),
+  ).toBeVisible();
+  await expect(dialog.getByText(/"feedback": null/)).toBeVisible();
+  await dialog.getByRole("button", { name: "Close activity details" }).click();
+  await firstHistory.getByText("Pass 2 of up to 2", { exact: true }).click();
+  await firstHistory
+    .getByRole("button", { name: "View Alpha pass 2 (completed)", exact: true })
+    .click();
+  await expect(dialog.getByText(/"notes": "Fixture output/)).toBeVisible();
+  await dialog.getByRole("button", { name: "Close activity details" }).click();
+  const before = await (
+    await page.request.get(`/api/pipeline-runs/${id}`)
+  ).json();
+  expect(before.units["finish/writer"]).toBeUndefined();
+  await page.getByRole("button", { name: "Resume", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "maximum of 2 total passes",
+  );
+  const after = await (
+    await page.request.get(`/api/pipeline-runs/${id}`)
+  ).json();
+  expect(after.visits).toEqual(before.visits);
+  expect(errors).toEqual([]);
+});
+
+test("edit loop conditions with typed values and custom paths without losing feedback", async ({
+  page,
+}) => {
+  const definition = workflow(`loop-editor-${crypto.randomUUID().slice(0, 8)}`);
+  const stage = definition.stages[1];
+  stage.outputSchema.properties = {
+    summary: { type: "string" },
+    needsRevision: { type: "boolean" },
+    details: { type: "object" },
+  };
+  stage.loop = {
+    targetStageId: "discover",
+    condition: {
+      agentId: "writer",
+      pointer: "/needsRevision",
+      operator: "equals",
+      value: true,
+    },
+    maxIterations: 3,
+    feedback: {
+      review: {
+        source: "stage",
+        stageId: "report",
+        agentId: "writer",
+        pointer: "",
+      },
+      context: {
+        source: "stage",
+        stageId: "discover",
+        agentId: "alpha",
+        pointer: "",
+      },
+    },
+  };
+  const created = await page.request.put(`/api/pipelines/${definition.id}`, {
+    data: { value: definition },
+  });
+  await expect(created).toBeOK();
+  const before = (await created.json()).value;
+  await page.goto(`/pipelines/${definition.id}`);
+  const edit = page.getByRole("button", {
+    name: "Edit loop: Report",
+    exact: true,
+  });
+  await expect(edit).toContainText("If needsRevision is true");
+  await expect(edit).toContainText("Otherwise: finish workflow");
+  await edit.click();
+  const preview = page.getByRole("region", { name: "Loop preview" });
+  await expect(preview).toContainText("If needsRevision is true");
+  await expect(preview).toContainText("Finish the workflow");
+  await expect(
+    page.getByRole("combobox", { name: "Comparison value", exact: true }),
+  ).toHaveValue("true");
+  await expect(
+    page.getByText("review, context", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("textbox", { name: "Loop feedback bindings" }),
+  ).not.toBeVisible();
+  async function save() {
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(
+      page.getByText("All changes saved", { exact: false }),
+    ).toBeVisible();
+    return (
+      await (await page.request.get(`/api/pipelines/${definition.id}`)).json()
+    ).value;
+  }
+  expect(await save()).toEqual(before);
+  await edit.click();
+  await page
+    .getByRole("combobox", { name: "Comparison value", exact: true })
+    .selectOption("false");
+  await expect(preview).toContainText("If needsRevision is false");
+  let saved = await save();
+  expect(saved.stages[1].loop.condition.value).toBe(false);
+  expect(saved.stages[1].loop.feedback).toEqual(stage.loop.feedback);
+
+  await edit.click();
+  await page
+    .getByRole("combobox", { name: "Output field", exact: true })
+    .selectOption("custom");
+  await page
+    .getByRole("textbox", { name: "Custom field path", exact: true })
+    .fill("/details/status");
+  await page
+    .getByRole("combobox", { name: "Value type", exact: true })
+    .selectOption("string");
+  await page
+    .getByRole("textbox", { name: "Comparison value", exact: true })
+    .fill("true");
+  await expect(preview).toContainText('If details/status is "true"');
+  saved = await save();
+  expect(saved.stages[1].loop.condition).toEqual({
+    agentId: "writer",
+    pointer: "/details/status",
+    operator: "equals",
+    value: "true",
+  });
+  expect(saved.stages[1].loop.feedback).toEqual(stage.loop.feedback);
+  await page.reload();
+  await edit.click();
+  await expect(
+    page.getByRole("textbox", { name: "Custom field path", exact: true }),
+  ).toHaveValue("/details/status");
+  await page
+    .getByRole("combobox", { name: "Value type", exact: true })
+    .selectOption("json");
+  await page
+    .getByRole("textbox", { name: "Comparison value", exact: true })
+    .fill('{"ready":true}');
+  saved = await save();
+  expect(saved.stages[1].loop.condition.value).toEqual({ ready: true });
+  expect(saved.stages[1].loop.feedback).toEqual(stage.loop.feedback);
+
+  await edit.click();
+  await page
+    .getByRole("textbox", { name: "Comparison value", exact: true })
+    .fill("{");
+  await expect(page.getByRole("alert")).toBeVisible();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("invalid fields");
+  expect(
+    (await (await page.request.get(`/api/pipelines/${definition.id}`)).json())
+      .value,
+  ).toEqual(saved);
+  await page
+    .getByRole("combobox", { name: "Comparison", exact: true })
+    .selectOption("notEquals");
+  await expect(
+    page.getByRole("textbox", { name: "Comparison value", exact: true }),
+  ).toHaveValue(JSON.stringify({ ready: true }, null, 2));
+  saved = await save();
+  expect(saved.stages[1].loop.condition.value).toEqual({ ready: true });
+  expect(saved.stages[1].loop.condition.operator).toBe("notEquals");
+  await edit.click();
+  await page
+    .getByRole("textbox", { name: "Comparison value", exact: true })
+    .fill("{");
+  await page
+    .getByRole("checkbox", {
+      name: "Repeat earlier stages when a condition matches",
+    })
+    .uncheck();
+  await expect(page.getByRole("alert")).not.toBeVisible();
+  await expect(preview).not.toBeVisible();
+  await expect(edit).not.toBeVisible();
+  await expect(
+    page.getByText("Repeat: back to Discover", { exact: true }),
+  ).not.toBeVisible();
+  saved = await save();
+  expect(saved.stages[1].loop).toBeUndefined();
+});
+
+test("keep the full loop visible when loading a long workflow and opening its editor", async ({
+  page,
+}) => {
+  const definition = workflow(`loop-canvas-${crypto.randomUUID().slice(0, 8)}`);
+  for (let step = 3; step <= 7; step++) {
+    definition.stages.push({
+      ...definition.stages[1],
+      id: `step-${step}`,
+      name: `Stage ${step}`,
+    });
+  }
+  definition.stages[6].loop = {
+    targetStageId: "discover",
+    condition: {
+      agentId: "writer",
+      pointer: "/summary",
+      operator: "equals",
+      value: "repeat",
+    },
+    maxIterations: 3,
+    feedback: {},
+  };
+  await expect(
+    await page.request.put(`/api/pipelines/${definition.id}`, {
+      data: { value: definition },
+    }),
+  ).toBeOK();
+  await page.goto(`/pipelines/${definition.id}`);
+  const first = page.getByRole("group", {
+    name: "Discover stage",
+    exact: true,
+  });
+  const last = page.getByRole("group", { name: "Stage 7 stage", exact: true });
+  await expect(first).toBeInViewport({ ratio: 0.99 });
+  await expect(last).toBeInViewport({ ratio: 0.99 });
+  await page
+    .getByRole("button", { name: "Edit loop: Stage 7", exact: true })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Loop preview" }),
+  ).toContainText('If summary is "repeat"');
+  await expect(first).toBeInViewport({ ratio: 0.99 });
+  await expect(last).toBeInViewport({ ratio: 0.99 });
+});
+
+test("choose linked Markdown files independently for agents and show browse/save errors", async ({
+  page,
+  instructionFile,
+}) => {
+  const directory = path.dirname(instructionFile);
+  const filename = path.basename(instructionFile);
+  fs.mkdirSync(path.join(directory, "nested"));
+  fs.writeFileSync(
+    path.join(directory, "ignore.txt"),
+    "Not an instruction file.",
+  );
+  const definition = workflow(
+    `instruction-files-${crypto.randomUUID().slice(0, 8)}`,
+  );
+  const missingFile = path.join(directory, "missing.md");
+  fs.writeFileSync(missingFile, "# Instructions\nThis file will be removed.");
+  definition.stages[0].agents[0].instructionsFile = missingFile;
+  await expect(
+    await page.request.put(`/api/pipelines/${definition.id}`, {
+      data: { value: definition },
+    }),
+  ).toBeOK();
+  fs.unlinkSync(missingFile);
+  await page.goto(`/pipelines/${definition.id}`);
+  await page.getByRole("button", { name: "Alpha Backend default" }).click();
+  const file = page.getByRole("status", { name: "Agent instructions file" });
+  await expect(
+    page.getByRole("textbox", { name: "Agent instructions file" }),
+  ).toHaveCount(0);
+  await expect(file).toHaveText("missing.md");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "Cannot read instructions file",
+  );
+  await page.getByRole("button", { name: "Choose Markdown file" }).click();
+  const picker = page.getByRole("dialog", { name: "Choose Markdown file" });
+  await expect(
+    picker.getByRole("button", { name: filename, exact: true }),
+  ).toBeVisible();
+  await expect(
+    picker.getByRole("button", { name: "ignore.txt", exact: true }),
+  ).toHaveCount(0);
+  await picker.getByLabel("Directory", { exact: true }).fill("relative/path");
+  await picker
+    .getByRole("button", { name: "Open directory", exact: true })
+    .click();
+  await expect(picker.getByRole("alert")).toContainText("absolute path");
+  await picker.getByLabel("Directory", { exact: true }).fill(directory);
+  await picker
+    .getByRole("button", { name: "Open directory", exact: true })
+    .click();
+  await picker.getByRole("button", { name: "nested/", exact: true }).click();
+  await expect(
+    picker.getByText("No directories or Markdown files."),
+  ).toBeVisible();
+  await picker.getByRole("button", { name: "Parent directory" }).click();
+  await picker.getByRole("button", { name: filename, exact: true }).click();
+  await expect(picker).not.toBeVisible();
+  await expect(file).toHaveText(filename);
+  await page.getByRole("button", { name: "Beta Backend default" }).click();
+  await expect(file).toHaveText("No file selected");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(
+    page.getByText("All changes saved", { exact: false }),
+  ).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "Alpha Backend default" }).click();
+  await expect(file).toHaveText(filename);
+  const saved = await (
+    await page.request.get(`/api/pipelines/${definition.id}`)
+  ).json();
+  expect(saved.value.stages[0].agents[0].instructionsFile).toBe(
+    instructionFile,
+  );
+  expect(saved.value.stages[0].agents[0].instructions).toBe("");
+  expect(saved.value.stages[0].agents[1].instructionsFile).toBeUndefined();
+  await page.getByRole("button", { name: "Choose Markdown file" }).click();
+  await expect(picker).toBeVisible();
+  await picker.press("Escape");
+  await expect(picker).not.toBeVisible();
+  await expect(file).toBeVisible();
+});
+
+test("instruction filenames stay below their label and truncate without hiding the picker", async ({
+  page,
+  instructionFile,
+}) => {
+  const filename = `${"long-agent-instructions-".repeat(8)}chromium.md`;
+  const longFile = path.join(path.dirname(instructionFile), filename);
+  fs.renameSync(instructionFile, longFile);
+  const definition = workflow(
+    `instruction-layout-${crypto.randomUUID().slice(0, 8)}`,
+  );
+  definition.stages[0].agents[0].instructionsFile = longFile;
+  await expect(
+    await page.request.put(`/api/pipelines/${definition.id}`, {
+      data: { value: definition },
+    }),
+  ).toBeOK();
+  await page.goto(`/pipelines/${definition.id}`);
+  await page.getByRole("button", { name: "Alpha Backend default" }).click();
+  const file = page.getByRole("status", { name: "Agent instructions file" });
+  for (const width of [1440, 375]) {
+    await page.setViewportSize({ width, height: 960 });
+    await expect(file).toHaveText(filename);
+    await expect(file).toHaveAttribute("title", longFile);
+    const layout = await file.evaluate((element) => {
+      const field = element.closest(".field")!;
+      const label = field.querySelector("span")!.getBoundingClientRect();
+      const name = element.getBoundingClientRect();
+      const picker = field.querySelector("button")!.getBoundingClientRect();
+      return {
+        belowLabel: name.top >= label.bottom,
+        truncated: element.scrollWidth > element.clientWidth,
+        pickerFits:
+          picker.left >= name.right &&
+          picker.right <= field.getBoundingClientRect().right,
+      };
+    });
+    expect(layout).toEqual({
+      belowLabel: true,
+      truncated: true,
+      pickerFits: true,
+    });
+    await page.getByRole("button", { name: "Choose Markdown file" }).click();
+    const picker = page.getByRole("dialog", { name: "Choose Markdown file" });
+    await expect(picker).toBeVisible();
+    await picker.press("Escape");
+  }
+});
+
+test("completed runs download a ZIP and show download errors without leaving the run", async ({
+  page,
+}) => {
+  const definition = workflow(`download-${crypto.randomUUID().slice(0, 8)}`);
+  await expect(
+    await page.request.put(`/api/pipelines/${definition.id}`, {
+      data: { value: definition },
+    }),
+  ).toBeOK();
+  const launched = await page.request.post(
+    `/api/pipelines/${definition.id}/runs`,
+    {
+      data: {
+        input: { context: "Download completed run assets." },
+        requestId: crypto.randomUUID(),
+      },
+    },
+  );
+  await expect(launched).toBeOK();
+  const run = await launched.json();
+  await page.goto(`/runs/${run.id}`);
+  const button = page.getByRole("button", { name: "Download assets" });
+  await expect(button).toBeVisible();
+  const endpoint = `**/api/pipeline-runs/${run.id}/assets`;
+  await page.route(endpoint, (route) =>
+    route.fulfill({
+      status: 409,
+      json: { error: "Published report changed since this run completed." },
+    }),
+  );
+  await button.click();
+  await expect(page.getByRole("alert")).toContainText(
+    "Published report changed",
+  );
+  await expect(page).toHaveURL(new RegExp(`/runs/${run.id}$`));
+  await expect(button).toBeEnabled();
+  await page.unroute(endpoint);
+  const downloading = page.waitForEvent("download");
+  await button.click();
+  const download = await downloading;
+  expect(download.suggestedFilename()).toBe(`${run.id}-assets.zip`);
+  expect(await download.failure()).toBeNull();
+  const file = await download.path();
+  if (!file) throw new Error("Download file is missing.");
+  const archive = unzipSync(fs.readFileSync(file));
+  expect(archive["execution/snapshot.json"]).toBeDefined();
+  expect(strFromU8(archive["execution/result.json"])).toContain(
+    "Fixture output - automated testing only",
+  );
+  await expect(page.getByRole("alert")).not.toBeVisible();
+});
+
+test("a blocked outcome stops execution and leaves later stages unexecuted", async ({
+  page,
+}) => {
+  const definition = workflow(
+    `blocked-outcome-${crypto.randomUUID().slice(0, 8)}`,
+  );
+  definition.stages[0].outputSchema.properties = {
+    summary: { type: "string" },
+    status: { type: "string", enum: ["blocked"] },
+  };
+  await expect(
+    await page.request.put(`/api/pipelines/${definition.id}`, {
+      data: { value: definition },
+    }),
+  ).toBeOK();
+  const launched = await page.request.post(
+    `/api/pipelines/${definition.id}/runs`,
+    {
+      data: {
+        input: { context: "Do not advance past a business blocker." },
+        requestId: crypto.randomUUID(),
+      },
+    },
+  );
+  await expect(launched).toBeOK();
+  const run = await launched.json();
+  await page.goto(`/runs/${run.id}`);
+  await expect(page.getByRole("alert")).toContainText(
+    'reported status "blocked"',
+  );
+  await expect(
+    page.getByRole("button", { name: "Download assets" }),
+  ).toHaveCount(0);
+  const discover = page.getByRole("region", { name: "Discover stage" });
+  await expect(discover).toHaveAccessibleDescription("Executed");
+  await expect(
+    discover.getByRole("button", { name: "View Alpha input and output" }),
+  ).toContainText("blocked");
+  await expect(
+    discover.getByRole("button", { name: "Rerun from Discover" }),
+  ).toBeEnabled();
+  const report = page.getByRole("region", { name: "Report stage" });
+  await expect(report).toHaveAccessibleDescription("Not executed");
+  await expect(
+    report.getByRole("button", { name: "View Writer input and output" }),
+  ).toHaveCount(0);
+  await expect(
+    report.getByRole("button", { name: "Rerun from Report" }),
+  ).toBeDisabled();
+  const stored = await (
+    await page.request.get(`/api/pipeline-runs/${run.id}`)
+  ).json();
+  expect(stored.status).toBe("blocked");
+  expect(stored.currentStage).toBe("discover");
+  expect(stored.units["@schema/report"]).toBeUndefined();
+  expect(stored.units["report/writer"]).toBeUndefined();
+  expect(stored.result).toBeUndefined();
+});
 
 test("saving prevents inspector and canvas edits from being silently discarded", async ({
   page,
+  instructionFile,
 }) => {
   const definition = workflow(`saving-${crypto.randomUUID().slice(0, 8)}`);
   await expect(
@@ -14,8 +652,10 @@ test("saving prevents inspector and canvas edits from being silently discarded",
   ).toBeOK();
   await page.goto(`/pipelines/${definition.id}`);
   await page.getByRole("button", { name: "Alpha Backend default" }).click();
-  const instructions = page.getByLabel("Agent instructions");
-  await instructions.fill("Keep this submitted instruction.");
+  const instructions = page.getByRole("button", {
+    name: "Choose Markdown file",
+  });
+  await chooseInstructionFile(page, instructionFile);
   const started = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   await page.route(`**/api/pipelines/${definition.id}`, async (route) => {
@@ -40,7 +680,9 @@ test("saving prevents inspector and canvas edits from being silently discarded",
   ).toBeVisible();
   await page.getByRole("button", { name: "Alpha Backend default" }).click();
   await expect(instructions).toBeEnabled();
-  await expect(instructions).toHaveValue("Keep this submitted instruction.");
+  await expect(
+    page.getByRole("status", { name: "Agent instructions file" }),
+  ).toHaveText(path.basename(instructionFile));
 });
 
 test("configure independent agent folders, persist them, and launch with restricted tools", async ({
@@ -117,11 +759,11 @@ test("configure independent agent folders, persist them, and launch with restric
     ).json();
     expect(run.allowedFolders).toBeUndefined();
     expect(run.allowAllTools).toBe(false);
-    await expect(
-      page.getByText("Fixture output - automated testing only", {
-        exact: false,
-      }),
-    ).toBeVisible();
+    const result = page.getByRole("region", { name: "Result", exact: true });
+    await expect(result).toContainText(
+      "This is a fixture-generated result summary.",
+    );
+    await expect(result.locator(".result-panel")).not.toBeVisible();
     await page
       .getByRole("button", { name: "View Beta input and output" })
       .click();
@@ -169,6 +811,7 @@ test("delete a workflow only after confirmation and remove it from the gallery",
 
 test("build, configure agents, save, reload, and run a user-composed workflow", async ({
   page,
+  instructionFile,
 }) => {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -185,9 +828,7 @@ test("build, configure agents, save, reload, and run a user-composed workflow", 
   await page.getByRole("button", { name: "Close inspector" }).click();
   await page.getByRole("button", { name: "New agent Backend default" }).click();
   await page.getByLabel("Agent name").fill("Second perspective");
-  await page
-    .getByLabel("Agent instructions")
-    .fill("Cross-check claims against supplied evidence.");
+  await chooseInstructionFile(page, instructionFile);
   await page.getByRole("button", { name: "Close inspector" }).click();
   const card = page.getByRole("group", {
     name: "Understand stage",
@@ -236,32 +877,28 @@ test("build, configure agents, save, reload, and run a user-composed workflow", 
     (await (await page.request.get(`/api/pipeline-runs/${runId}`)).json())
       .allowAllTools,
   ).toBe(true);
-  await expect(
-    page.getByText("Fixture output - automated testing only", { exact: false }),
-  ).toBeVisible();
+  const result = page.getByRole("region", { name: "Result", exact: true });
+  await expect(result).toContainText(
+    "This is a fixture-generated result summary.",
+  );
+  await expect(result.locator(".result-panel")).not.toBeVisible();
+  await result.getByText("Raw output", { exact: true }).click();
+  await expect(result.locator(".result-panel")).toContainText(
+    "Fixture output - automated testing only",
+  );
+  await result.getByText("Raw output", { exact: true }).click();
+  await expect(result.locator(".result-panel")).not.toBeVisible();
   await expect(
     page.getByRole("heading", { name: "Browser triage" }),
   ).toBeVisible();
-  await page
-    .getByRole("button", { name: "View Understand contract input and output" })
-    .click();
-  const contractDialog = page.getByRole("dialog", {
-    name: "Understand contract",
-  });
-  await expect(contractDialog).toBeVisible();
   await expect(
-    contractDialog.getByRole("region", { name: "Input", exact: true }),
-  ).toContainText('"type": "object"');
-  await expect(
-    contractDialog.getByRole("region", { name: "Output", exact: true }),
-  ).toContainText('"type": "object"');
-  await page.keyboard.press("Escape");
-  await expect(contractDialog).not.toBeVisible();
+    page.getByRole("status", { name: "Understand contract" }),
+  ).toHaveText("Understand contract");
   await expect(
     page.getByRole("button", {
       name: "View Understand contract input and output",
     }),
-  ).toBeFocused();
+  ).toHaveCount(0);
   const agentCard = page.getByRole("button", {
     name: "View Second perspective input and output",
   });
@@ -346,7 +983,7 @@ test("invalid JSON remains visible and cannot silently save an older value", asy
   await page.getByRole("button", { name: "Close inspector" }).click();
   await expect(page.getByLabel("Launch input schema")).toHaveValue("{invalid");
   await page.getByRole("button", { name: "Save", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("invalid JSON");
+  await expect(page.getByRole("alert")).toContainText("invalid fields");
   await page.getByLabel("Launch input schema").fill('{"type":"object"}');
   await page.getByRole("button", { name: "Save", exact: true }).click();
   await expect(
@@ -375,6 +1012,12 @@ test("import a reusable Markdown skill and register, pause, and edit a watch", a
   await page.goto("/watches");
   await page.getByRole("button", { name: "New watch" }).click();
   await page.getByLabel("Watch name").fill("Daily triage");
+  await expect(
+    page.getByRole("checkbox", { name: "Allow all tools for scheduled runs" }),
+  ).not.toBeChecked();
+  await page
+    .getByRole("checkbox", { name: "Allow all tools for scheduled runs" })
+    .check();
   await page
     .getByRole("combobox", { name: "Workflow", exact: true })
     .selectOption({ label: "Bug triage" });
@@ -391,5 +1034,16 @@ test("import a reusable Markdown skill and register, pause, and edit a watch", a
   ).toBeVisible();
   await page.getByRole("button", { name: "Daily triage", exact: true }).click();
   await expect(page.getByLabel("Cron expression")).toHaveValue("0 9 * * 1-5");
+  await expect(
+    page.getByRole("checkbox", { name: "Allow all tools for scheduled runs" }),
+  ).toBeChecked();
+  await page
+    .getByRole("checkbox", { name: "Allow all tools for scheduled runs" })
+    .uncheck();
+  await page.getByRole("button", { name: "Save watch" }).click();
+  await page.getByRole("button", { name: "Daily triage", exact: true }).click();
+  await expect(
+    page.getByRole("checkbox", { name: "Allow all tools for scheduled runs" }),
+  ).not.toBeChecked();
   await page.getByRole("button", { name: "Close watch editor" }).click();
 });

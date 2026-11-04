@@ -1,6 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { Background, Controls, ReactFlow, useNodesState } from "@xyflow/react";
+import {
+  Background,
+  Controls,
+  MarkerType,
+  ReactFlow,
+  useNodesInitialized,
+  useReactFlow,
+  useStore,
+  useNodesState,
+} from "@xyflow/react";
 import type { Connection, Edge, NodeChange } from "@xyflow/react";
 import {
   ArrowLeft,
@@ -10,6 +19,7 @@ import {
   Settings2,
   Play,
   Trash2,
+  Repeat2,
 } from "lucide-react";
 import "@xyflow/react/dist/style.css";
 import { stageSchema, workflowSchema } from "../../shared/contracts.ts";
@@ -21,6 +31,7 @@ import { Inspector } from "./inspector.tsx";
 import type { Selection } from "./inspector.tsx";
 import { StageNode } from "./stage-node.tsx";
 import type { StageCanvasNode } from "./stage-node.tsx";
+import { describeLoopCondition } from "./loop-labels.ts";
 
 const nodeTypes = { stage: StageNode };
 const newStage = () =>
@@ -68,7 +79,7 @@ export function WorkflowBuilder() {
   const [nodes, setNodes, onNodesChange] = useNodesState<StageCanvasNode>([]);
   function select(next?: Selection) {
     if (Object.values(invalid).some(Boolean)) {
-      setError("Fix invalid JSON before leaving this inspector.");
+      setError("Fix invalid fields before leaving this inspector.");
       return;
     }
     setSelection(next);
@@ -102,6 +113,9 @@ export function WorkflowBuilder() {
         data: {
           stage,
           index,
+          loopTargetName: workflow.stages.find(
+            (item) => item.id === stage.loop?.targetStageId,
+          )?.name,
           selectStage: () => select({ kind: "stage", stageId: stage.id }),
           selectAgent: (agentId: string) =>
             select({ kind: "agent", stageId: stage.id, agentId }),
@@ -122,15 +136,47 @@ export function WorkflowBuilder() {
     return () => window.removeEventListener("keydown", escape);
   }, [invalid]);
   const edges = useMemo<Edge[]>(
-    () =>
-      workflow.stages.slice(1).map((stage, index) => ({
+    () => [
+      ...workflow.stages.slice(1).map((stage, index) => ({
         id: `${workflow.stages[index].id}-${stage.id}`,
         source: workflow.stages[index].id,
         target: stage.id,
         type: "smoothstep",
-        style: { stroke: "#b8b4cb", strokeWidth: 1.5 },
+        label: workflow.stages[index].loop ? "Otherwise" : undefined,
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+          color: workflow.stages[index].loop ? "#33846a" : "#b8b4cb",
+        },
+        labelStyle: { fill: "#286b56", fontWeight: 600, fontSize: 12 },
+        labelBgPadding: [6, 4] as [number, number],
+        labelBgBorderRadius: 4,
+        style: {
+          stroke: workflow.stages[index].loop ? "#33846a" : "#b8b4cb",
+          strokeWidth: 1.5,
+        },
         deletable: false,
       })),
+      ...workflow.stages
+        .filter((stage) => stage.loop)
+        .map((stage) => ({
+          id: `loop-${stage.id}`,
+          source: stage.id,
+          target: stage.loop!.targetStageId,
+          sourceHandle: "loop-out",
+          targetHandle: "loop-in",
+          type: "smoothstep",
+          label: `Repeat: back to ${workflow.stages.find((item) => item.id === stage.loop!.targetStageId)?.name}`,
+          ariaLabel: `${stage.name}: if ${describeLoopCondition(stage.loop!)} repeat from ${stage.loop!.targetStageId}. Click to edit loop.`,
+          markerEnd: { type: MarkerType.ArrowClosed, color: "#9b6b16" },
+          pathOptions: { offset: 75, borderRadius: 16 },
+          labelStyle: { fill: "#81520e", fontWeight: 600, fontSize: 12 },
+          labelBgStyle: { fill: "#fffbf0", stroke: "#e9d7ad" },
+          labelBgPadding: [10, 7] as [number, number],
+          labelBgBorderRadius: 6,
+          style: { stroke: "#9b6b16", strokeWidth: 2, strokeDasharray: "6 4" },
+          deletable: false,
+        })),
+    ],
     [workflow],
   );
   function update(next: Workflow) {
@@ -184,7 +230,7 @@ export function WorkflowBuilder() {
     setError("");
     try {
       if (Object.values(invalid).some(Boolean))
-        throw new Error("Fix the invalid JSON fields before saving.");
+        throw new Error("Fix the invalid fields before saving.");
       const next = workflowSchema.parse(
         duplicate
           ? {
@@ -327,6 +373,45 @@ export function WorkflowBuilder() {
               Add stage
             </button>
           </div>
+          {workflow.stages.some((stage) => stage.loop) && (
+            <div className="canvas-loops" aria-label="Workflow loops">
+              {workflow.stages.map(
+                (stage, index) =>
+                  stage.loop && (
+                    <button
+                      key={stage.id}
+                      className="canvas-loop-summary"
+                      aria-label={`Edit loop: ${stage.name}`}
+                      onClick={() =>
+                        select({ kind: "stage", stageId: stage.id })
+                      }
+                    >
+                      <strong>
+                        <Repeat2 size={15} /> {stage.name} decision
+                      </strong>
+                      <span>If {describeLoopCondition(stage.loop)}</span>
+                      <span>
+                        Back to{" "}
+                        <b>
+                          {
+                            workflow.stages.find(
+                              (item) => item.id === stage.loop?.targetStageId,
+                            )?.name
+                          }
+                        </b>{" "}
+                        · up to {stage.loop.maxIterations} passes
+                      </span>
+                      <small>
+                        Otherwise:{" "}
+                        {workflow.stages[index + 1]
+                          ? `continue to ${workflow.stages[index + 1].name}`
+                          : "finish workflow"}
+                      </small>
+                    </button>
+                  ),
+              )}
+            </div>
+          )}
           <ReactFlow
             nodes={nodes}
             edges={edges}
@@ -339,6 +424,12 @@ export function WorkflowBuilder() {
               })
             }
             onConnect={connect}
+            onEdgeClick={(_event, edge) => {
+              const stage = workflow.stages.find(
+                (item) => `loop-${item.id}` === edge.id,
+              );
+              if (stage) select({ kind: "stage", stageId: stage.id });
+            }}
             nodesDraggable={!busy}
             nodesConnectable={!busy}
             onPaneClick={() => select()}
@@ -349,6 +440,7 @@ export function WorkflowBuilder() {
           >
             <Background color="#d5d5d1" gap={22} size={1} />
             <Controls showInteractive={false} />
+            <FitWorkflow />
           </ReactFlow>
           <div className="canvas-hint">
             Drag to arrange · Connect to reorder · Click an agent to configure
@@ -371,4 +463,15 @@ export function WorkflowBuilder() {
       </div>
     </div>
   );
+}
+
+function FitWorkflow() {
+  const initialized = useNodesInitialized();
+  const width = useStore((state) => state.width);
+  const height = useStore((state) => state.height);
+  const { fitView } = useReactFlow();
+  useEffect(() => {
+    if (initialized && width && height) void fitView({ padding: 0.2 });
+  }, [initialized, width, height, fitView]);
+  return null;
 }

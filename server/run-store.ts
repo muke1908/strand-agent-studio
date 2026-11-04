@@ -5,7 +5,10 @@ import { z } from "zod";
 import {
   allowedFoldersSchema,
   jsonValue,
+  loopContextSchema,
+  loopRouteSchema,
   skillSchema,
+  stageSkipSchema,
   workflowSchema,
 } from "../shared/contracts.ts";
 import type { Json, Run, Skill, Workflow } from "../shared/contracts.ts";
@@ -17,6 +20,12 @@ import {
   writeJson,
 } from "./files.ts";
 import { identifier } from "../shared/contracts.ts";
+import { stageCheckpointSchema } from "./run-checkpoint.ts";
+
+const continuationSchema = z.object({
+  sourceRunId: identifier,
+  fromStageId: identifier,
+});
 
 const status = z.enum([
   "queued",
@@ -25,6 +34,23 @@ const status = z.enum([
   "blocked",
   "cancelled",
 ]);
+const unitSchema = z.object({
+  stageId: z.string(),
+  agentId: z.string(),
+  name: z.string(),
+  status: z.union([status, z.literal("skipped")]),
+  output: jsonValue.optional(),
+  reusedFrom: identifier.optional(),
+  visitId: identifier.optional(),
+  attempts: z.array(
+    z.object({
+      id: z.string(),
+      status,
+      error: z.string().optional(),
+      output: jsonValue.optional(),
+    }),
+  ),
+});
 const runSchema: z.ZodType<Run> = z.object({
   id: identifier,
   workflowId: identifier,
@@ -37,28 +63,26 @@ const runSchema: z.ZodType<Run> = z.object({
   allowedFolders: allowedFoldersSchema.optional(),
   error: z.string().optional(),
   currentStage: z.string().optional(),
+  currentVisit: identifier.optional(),
+  visits: z
+    .array(
+      z.object({
+        id: identifier,
+        stageId: identifier,
+        iteration: z.number().int().positive(),
+        units: z.record(z.string(), unitSchema),
+        loopContext: loopContextSchema.optional(),
+        route: loopRouteSchema.optional(),
+      }),
+    )
+    .optional(),
+  continuation: continuationSchema.optional(),
+  stageSkips: z.array(stageSkipSchema).optional(),
   result: jsonValue.optional(),
   trigger: z
     .object({ watchId: z.string(), eventId: z.string(), reason: z.string() })
     .optional(),
-  units: z.record(
-    z.string(),
-    z.object({
-      stageId: z.string(),
-      agentId: z.string(),
-      name: z.string(),
-      status,
-      output: jsonValue.optional(),
-      attempts: z.array(
-        z.object({
-          id: z.string(),
-          status,
-          error: z.string().optional(),
-          output: jsonValue.optional(),
-        }),
-      ),
-    }),
-  ),
+  units: z.record(z.string(), unitSchema),
 });
 const snapshotSchema = z.object({
   workflow: workflowSchema,
@@ -68,6 +92,20 @@ const snapshotSchema = z.object({
   allowAllTools: z.boolean().optional(),
   // Preserve historical run-wide grants during recovery.
   allowedFolders: allowedFoldersSchema.optional(),
+  stageSkips: z.array(stageSkipSchema).optional(),
+  continuation: continuationSchema
+    .extend({
+      checkpoints: z.array(stageCheckpointSchema),
+      history: z.record(
+        z.string(),
+        z.object({
+          output: jsonValue.optional(),
+          error: z.string().optional(),
+          attemptDirectories: z.array(z.string()),
+        }),
+      ),
+    })
+    .optional(),
 });
 type Snapshot = z.infer<typeof snapshotSchema>;
 const manifestSchema = z.record(z.string(), z.string());
@@ -153,6 +191,10 @@ export function createRunStore(root: string) {
       backendId: string,
       trigger?: Run["trigger"],
       allowAllTools = false,
+      recovery?: Pick<
+        Snapshot,
+        "continuation" | "allowedFolders" | "stageSkips"
+      >,
     ): Run {
       const id = `run-${randomUUID()}`;
       const time = new Date().toISOString();
@@ -166,7 +208,22 @@ export function createRunStore(root: string) {
         requestId,
         allowAllTools,
         units: {},
+        ...(recovery?.stageSkips?.length
+          ? { stageSkips: recovery.stageSkips }
+          : {}),
         ...(trigger ? { trigger } : {}),
+        ...(recovery?.allowedFolders
+          ? { allowedFolders: recovery.allowedFolders }
+          : {}),
+        ...(recovery?.continuation
+          ? {
+              continuation: {
+                sourceRunId: recovery.continuation.sourceRunId,
+                fromStageId: recovery.continuation.fromStageId,
+              },
+              currentStage: recovery.continuation.fromStageId,
+            }
+          : {}),
       };
       fs.mkdirSync(directory(id), { recursive: true });
       writeJson(path.join(directory(id), "manifest.json"), {});
@@ -176,6 +233,7 @@ export function createRunStore(root: string) {
         input,
         backendId,
         allowAllTools,
+        ...recovery,
       });
       save(run);
       return run;

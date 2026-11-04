@@ -1,6 +1,6 @@
 import { Handle, Position } from "@xyflow/react";
 import type { Node, NodeProps } from "@xyflow/react";
-import { Bot, GripVertical } from "lucide-react";
+import { Bot, GripVertical, Repeat2 } from "lucide-react";
 import type { Stage } from "../../shared/contracts.ts";
 
 export type StageNodeData = {
@@ -9,6 +9,7 @@ export type StageNodeData = {
   selectStage: () => void;
   selectAgent: (id: string) => void;
   selectedAgent?: string;
+  loopTargetName?: string;
 };
 export type StageCanvasNode = Node<StageNodeData, "stage">;
 export function StageNode({ data, selected }: NodeProps<StageCanvasNode>) {
@@ -49,7 +50,36 @@ export function StageNode({ data, selected }: NodeProps<StageCanvasNode>) {
           {data.stage.agents.length > 1 ? "s" : ""}
         </span>
       </div>
+      {data.stage.loop && (
+        <button
+          className="stage-loop-badge nodrag"
+          onClick={data.selectStage}
+          aria-label={`Edit loop for ${data.stage.name}`}
+        >
+          <Repeat2 size={14} />
+          <span>
+            Back to <strong>{data.loopTargetName}</strong>
+          </span>
+          <small>Up to {data.stage.loop.maxIterations} passes</small>
+        </button>
+      )}
       <Handle type="source" position={Position.Right} />
+      <Handle
+        id="loop-out"
+        className="loop-handle"
+        type="source"
+        position={Position.Bottom}
+        style={{ left: "70%" }}
+        isConnectable={false}
+      />
+      <Handle
+        id="loop-in"
+        className="loop-handle"
+        type="target"
+        position={Position.Bottom}
+        style={{ left: "30%" }}
+        isConnectable={false}
+      />
     </div>
   );
 }

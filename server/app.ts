@@ -4,15 +4,19 @@ import fs from "node:fs";
 import { z } from "zod";
 import {
   jsonValue,
+  identifier,
   skillSchema,
   workflowSchema,
   watchSchema,
 } from "../shared/contracts.ts";
+import type { RunDetails, WatchDashboardItem } from "../shared/contracts.ts";
 import type { Catalog } from "./catalog.ts";
 import type { RunHost } from "./run-host.ts";
 import type { Watcher } from "./watcher.ts";
 import type { AgentBackend } from "./agent-backend.ts";
 import { unitDetails } from "./unit-details.ts";
+import { instructionDirectory } from "./instruction-files.ts";
+import { runAssets } from "./run-assets.ts";
 
 export function createApp(
   catalog: Catalog,
@@ -54,6 +58,16 @@ export function createApp(
   app.get("/api/pipelines", (_request, response) =>
     response.json(catalog.workflows()),
   );
+  app.get("/api/instruction-files", (request, response) => {
+    const directory = z
+      .string()
+      .min(1)
+      .max(4096)
+      .refine((value) => !value.includes("\0"))
+      .optional()
+      .parse(request.query.directory);
+    response.json(instructionDirectory(directory));
+  });
   app.get("/api/pipelines/:id", (request, response) =>
     response.json(catalog.workflow(request.params.id)),
   );
@@ -114,11 +128,30 @@ export function createApp(
   );
   app.get("/api/pipeline-runs/:id", (request, response) => {
     host.store.verify(request.params.id);
-    response.json(host.store.get(request.params.id));
+    const run: RunDetails = {
+      ...host.store.get(request.params.id),
+      resultSummary: host.summaries.read(request.params.id),
+      stages: host.store
+        .snapshot(request.params.id)
+        .workflow.stages.map(({ id, name, agents }) => ({
+          id,
+          name,
+          agents: agents.map(({ id, name }) => ({ id, name })),
+        })),
+    };
+    response.json(run);
   });
   app.get("/api/pipeline-runs/:id/logs", (request, response) =>
     response.json({ content: host.store.logs(request.params.id) }),
   );
+  app.get("/api/pipeline-runs/:id/assets", (request, response) => {
+    const archive = runAssets(host.store, request.params.id);
+    response
+      .set("Cache-Control", "no-store")
+      .type("application/zip")
+      .attachment(`${request.params.id}-assets.zip`)
+      .send(Buffer.from(archive));
+  });
   app.get("/api/pipeline-runs/:id/activity", (request, response) => {
     const key = z.string().min(1).max(200).parse(request.query.unit);
     response.json(unitDetails(host.store, request.params.id, key));
@@ -126,6 +159,43 @@ export function createApp(
   app.post("/api/pipeline-runs/:id/resume", (request, response) =>
     response.json(host.resume(request.params.id)),
   );
+  app.post("/api/pipeline-runs/:id/rerun", (request, response) => {
+    const body = z
+      .object({
+        stageId: identifier,
+        requestId: z.string().min(1).max(160),
+      })
+      .strict()
+      .parse(request.body);
+    response
+      .status(202)
+      .json(host.rerun(request.params.id, body.stageId, body.requestId));
+  });
+  app.post("/api/pipeline-runs/:id/skip", (request, response) => {
+    const body = z
+      .object({
+        stageId: identifier,
+        requestId: z.string().min(1).max(160),
+        reason: z.string().trim().min(1).max(2000),
+        allowPublication: z.boolean(),
+      })
+      .strict()
+      .parse(request.body);
+    response
+      .status(202)
+      .json(
+        host.rerun(request.params.id, body.stageId, body.requestId, {
+          reason: body.reason,
+          allowPublication: body.allowPublication,
+        }),
+      );
+  });
+  app.post("/api/pipeline-runs/:id/result-summary", (request, response) => {
+    z.object({})
+      .strict()
+      .parse(request.body ?? {});
+    response.status(202).json(host.summaries.generate(request.params.id));
+  });
   app.post("/api/pipeline-runs/:id/stop", (request, response) =>
     response.json(host.stop(request.params.id)),
   );
@@ -146,6 +216,55 @@ export function createApp(
         .map((item) => ({ ...item, state: watcher.state(item.value.id) })),
     ),
   );
+  app.get("/api/watch-dashboard", (_request, response) => {
+    const items: WatchDashboardItem[] = catalog.watches().map((item) => {
+      const state = watcher.state(item.value.id);
+      const decision = state.decisions.findLast(
+        (entry) => entry.status === "launched" && entry.runId,
+      );
+      const run = decision?.runId ? host.store.get(decision.runId) : undefined;
+      let previousResultRun: WatchDashboardItem["previousResultRun"];
+      if (run && run.result === undefined) {
+        for (let index = state.decisions.length - 1; index >= 0; index--) {
+          const previous = state.decisions[index];
+          if (
+            previous.status !== "launched" ||
+            !previous.runId ||
+            previous.runId === run.id
+          )
+            continue;
+          const completed = host.store.get(previous.runId);
+          if (
+            completed.status === "completed" &&
+            completed.result !== undefined
+          ) {
+            previousResultRun = {
+              id: completed.id,
+              updatedAt: completed.updatedAt,
+              result: completed.result,
+            };
+            break;
+          }
+        }
+      }
+      return {
+        ...item,
+        state,
+        previousResultRun,
+        latestRun: run
+          ? {
+              id: run.id,
+              status: run.status,
+              createdAt: run.createdAt,
+              updatedAt: run.updatedAt,
+              error: run.error,
+              result: run.result,
+            }
+          : undefined,
+      };
+    });
+    response.json(items);
+  });
   app.put("/api/pipeline-watches/:id", (request, response) => {
     const body = z
       .object({ value: watchSchema, revision: z.string().optional() })

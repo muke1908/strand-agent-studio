@@ -53,6 +53,7 @@ export function Watches() {
           value: "Describe the context for this recurring run.",
         },
       },
+      allowAllTools: false,
       cooldownSeconds: 60,
       maxRunsPerHour: 10,
     });
@@ -84,6 +85,9 @@ export function Watches() {
         title="Watches"
         description="A schedule or a change. A fresh run, with the same safeguards."
       >
+        <Link className="button" to="/dashboard">
+          Dashboard
+        </Link>
         <button className="button primary" onClick={create}>
           <Plus size={16} />
           New watch
@@ -293,6 +297,22 @@ export function Watches() {
               </label>
             </div>
             <ErrorNotice error={jsonError || error} />
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={draft.allowAllTools ?? false}
+                onChange={(event) =>
+                  setDraft({ ...draft, allowAllTools: event.target.checked })
+                }
+                aria-describedby="watch-tool-permission-help"
+              />
+              Allow all tools for scheduled runs
+            </label>
+            <p className="muted" id="watch-tool-permission-help">
+              Automatically approves shell, web and MCP tools and URLs. Tools
+              can change files and access external services. Enable only for
+              trusted workflow instructions.
+            </p>
             <div className="form-footer">
               <span>Queue latest. No automatic failure loop.</span>
               <button

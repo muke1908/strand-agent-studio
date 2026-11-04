@@ -17,6 +17,7 @@ import {
 } from "./files.ts";
 import { validateWorkflow } from "./validation.ts";
 import { resolveWorkflowFolders } from "./allowed-folders.ts";
+import { resolveWorkflowInstructions } from "./instruction-files.ts";
 
 export function createCatalog(root: string) {
   privateDirectory(root);
@@ -76,6 +77,7 @@ export function createCatalog(root: string) {
     watch: (id: string) => get("watches", id, watchSchema),
     saveWorkflow(value: Workflow, revision?: string) {
       const parsed = resolveWorkflowFolders(workflowSchema.parse(value));
+      resolveWorkflowInstructions(parsed);
       const skills = list("skills", skillSchema).map((item) => item.value);
       try {
         validateWorkflow(parsed, skills);

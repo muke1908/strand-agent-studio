@@ -9,7 +9,7 @@ TypeScript throughout; Node.js, Express, React and React Flow. No dependency on 
 Requires Node.js **24.13 or later**.
 
 ```sh
-git clone https://github.com/muke1908/strand-agent-studio.git
+git clone https://github.com/mukeshbiswas_microsoft/strand-agent-studio.git
 cd strand-agent-studio
 npm install
 npm run dev
@@ -25,6 +25,8 @@ npm start
 ```
 
 Open **http://localhost:4200**.
+
+Saved personal workflows, linked agent instructions, and shared skills live in the separate private [strand-workflows](https://github.com/mukeshbiswas_microsoft/strand-workflows) repository. Local run history and runtime state are not included in either repository.
 
 Install and authenticate the GitHub Copilot CLI before running real agents. If it is not on your PATH, set `COPILOT_BIN` to its executable or JavaScript entry point. Settings reports backend availability; unavailable execution fails explicitly rather than fabricating results.
 

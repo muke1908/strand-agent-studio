@@ -20,6 +20,13 @@ export function fixtureBackend(): AgentBackend {
       });
       if (request.purpose === "schema")
         return JSON.parse(JSON.stringify(request.input));
+      if (request.purpose === "summary")
+        return {
+          lines: [
+            "This is a fixture-generated result summary.",
+            "No real external actions were performed.",
+          ],
+        };
       return sample(request.schema);
     },
   };
