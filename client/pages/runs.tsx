@@ -59,12 +59,21 @@ function reportedOutcome(unit?: Unit): string | undefined {
 
 export function Runs() {
   const { data, error } = useResource<Run[]>("/pipeline-runs", true);
+  const groups = new Map<string, { name: string; runs: Run[] }>();
+  for (const run of data ?? []) {
+    let group = groups.get(run.workflowId);
+    if (!group) {
+      group = { name: run.workflowName, runs: [] };
+      groups.set(run.workflowId, group);
+    }
+    if (group.runs.length < 10) group.runs.push(run);
+  }
   return (
     <div className="page">
       <PageHeader
         eyebrow="EXECUTION HISTORY"
         title="Runs"
-        description="Every attempt, every handoff, every result. Nothing hidden."
+        description="The 10 most recent runs for each workflow."
       />
       <ErrorNotice error={error} />
       {!data ? (
@@ -79,20 +88,36 @@ export function Runs() {
           </Link>
         </EmptyState>
       ) : (
-        <div className="list-panel">
-          {data.map((run) => (
-            <Link key={run.id} className="list-row" to={`/runs/${run.id}`}>
-              <div>
-                <strong>{run.workflowName}</strong>
-                <span>
-                  {run.trigger ? run.trigger.reason : "Manual run"} ·{" "}
-                  {new Date(run.createdAt).toLocaleString()}
+        <section className="run-history" aria-label="Recent runs">
+          {Array.from(groups, ([workflowId, group]) => (
+            <section key={workflowId} aria-labelledby={`runs-${workflowId}`}>
+              <div className="section-heading">
+                <h2 id={`runs-${workflowId}`}>{group.name}</h2>
+                <span className="eyebrow">
+                  {group.runs.length} {group.runs.length === 1 ? "run" : "runs"}
                 </span>
               </div>
-              <ExternalLink size={14} />
-            </Link>
+              <div className="list-panel">
+                {group.runs.map((run) => (
+                  <Link
+                    key={run.id}
+                    className="list-row"
+                    to={`/runs/${run.id}`}
+                  >
+                    <div>
+                      <strong>
+                        {run.trigger ? run.trigger.reason : "Manual run"}
+                      </strong>
+                      <span>{new Date(run.createdAt).toLocaleString()}</span>
+                    </div>
+                    <StatusBadge status={run.status} />
+                    <ExternalLink size={14} />
+                  </Link>
+                ))}
+              </div>
+            </section>
           ))}
-        </div>
+        </section>
       )}
     </div>
   );
@@ -115,6 +140,7 @@ export function RunDetail() {
     sourceRunId: string;
     stageId: string;
     requestId: string;
+    latestInstructions: boolean;
   }>();
   const [skipStage, setSkipStage] = useState<RunDetails["stages"][number]>();
   const skipDialog = useRef<HTMLDialogElement>(null);
@@ -234,21 +260,28 @@ export function RunDetail() {
       setSummaryBusy(false);
     }
   }
-  async function rerun(stage: RunDetails["stages"][number], index: number) {
+  async function rerun(
+    stage: RunDetails["stages"][number],
+    index: number,
+    latestInstructions = false,
+  ) {
     if (
       !run ||
       !window.confirm(
-        `Rerun from "${stage.name}"?\n\n${index ? "Earlier handoffs will be reused; earlier agents will not run." : "All stages will run again, including configured setup actions."}\nThis stage and every later stage will execute in a new run and may modify the existing workspace or external resources. The original run will remain unchanged.`,
+        `${latestInstructions ? "Restart" : "Rerun"} from "${stage.name}"?\n\n${index ? "Earlier handoffs will be reused; earlier agents will not run." : "All stages will run again, including configured setup actions."}\n${latestInstructions ? "Latest compatible instructions will be loaded. Interrupted attempts can be recovered only after their processes are confirmed stopped.\n" : ""}This stage and every later stage will execute in a new run and may modify the existing workspace or external resources. The original run will remain unchanged.`,
       )
     )
       return;
     const submission =
-      rerunRequest?.sourceRunId === run.id && rerunRequest.stageId === stage.id
+      rerunRequest?.sourceRunId === run.id &&
+      rerunRequest.stageId === stage.id &&
+      rerunRequest.latestInstructions === latestInstructions
         ? rerunRequest
         : {
             sourceRunId: run.id,
             stageId: stage.id,
             requestId: crypto.randomUUID(),
+            latestInstructions,
           };
     setRerunRequest(submission);
     setBusy(true);
@@ -258,6 +291,7 @@ export function RunDetail() {
         body: JSON.stringify({
           stageId: stage.id,
           requestId: submission.requestId,
+          ...(latestInstructions ? { latestInstructions: true } : {}),
         }),
       });
       setError("");
@@ -350,6 +384,13 @@ export function RunDetail() {
         </p>
       ))}
       <ErrorNotice error={error || resource.error || run.error || logs.error} />
+      {["blocked", "cancelled"].includes(run.status) && (
+        <p className="muted">
+          Restart a stage below to create a fresh attempt with the latest
+          compatible instructions. Earlier stages are reused, not repeated.
+          Resume keeps the original instructions and accepted outputs.
+        </p>
+      )}
       {skipStage && (
         <dialog
           ref={skipDialog}
@@ -478,6 +519,18 @@ export function RunDetail() {
                         )}
                       </div>
                       <div className="stage-actions">
+                        {["blocked", "cancelled"].includes(run.status) && (
+                          <button
+                            type="button"
+                            className="button"
+                            aria-label={`Restart from ${stage.name}`}
+                            disabled={busy || !prefixReady}
+                            onClick={() => void rerun(stage, index, true)}
+                          >
+                            <RotateCcw size={14} />
+                            Restart
+                          </button>
+                        )}
                         {["blocked", "cancelled"].includes(run.status) &&
                           run.currentStage === stage.id && (
                             <button

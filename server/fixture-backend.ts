@@ -20,6 +20,16 @@ export function fixtureBackend(): AgentBackend {
       });
       if (request.purpose === "schema")
         return JSON.parse(JSON.stringify(request.input));
+      if (request.purpose === "watch-condition")
+        return {
+          status: "ready",
+          reason:
+            "Fixture condition compilation only; no natural-language interpretation.",
+          conditions: [
+            { pointer: "/summary", operator: "notEquals", value: "" },
+          ],
+          deduplicationPointer: null,
+        };
       if (request.purpose === "summary")
         return {
           lines: [

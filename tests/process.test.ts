@@ -40,7 +40,7 @@ test("cancellation and supervisor loss clean up active inherited-group children"
         ],
         abort.signal,
       ),
-      action === "cancel" ? /cancelled/i : /ENOENT/,
+      action === "cancel" ? /cancelled/i : /without a termination receipt/,
     );
     try {
       await waitUntil(() => fs.existsSync(path.join(root, "started.json")));
@@ -60,6 +60,19 @@ test("cancellation and supervisor loss clean up active inherited-group children"
       else {
         assert(!fs.existsSync(path.join(root, "exit.json")));
         assert.throws(() => assertAttemptStopped(root), /unknown|still active/);
+        await waitUntil(() => {
+          const wrapper = ownerSchema.parse(
+            readJson(path.join(root, "wrapper.json")),
+          );
+          return !isAlive(wrapper);
+        });
+        assertAttemptStopped(root, true);
+        assertAttemptStopped(root);
+        assert.equal(
+          readJson(path.join(root, "recovery.json")).status,
+          "interrupted-stopped",
+        );
+        assert(!fs.existsSync(path.join(root, "exit.json")));
       }
     } finally {
       abort.abort();
@@ -184,7 +197,60 @@ test("nonzero process and unresolved launch windows fail closed", async () => {
     fs.unlinkSync(path.join(root, "exit.json"));
     writeJson(path.join(root, "launch.json"), {});
     assert.throws(() => assertAttemptStopped(root), /unknown/);
+    fs.unlinkSync(path.join(root, "cli.json"));
+    assert.throws(() => assertAttemptStopped(root, true), /unknown/);
+    assert(!fs.existsSync(path.join(root, "recovery.json")));
   } finally {
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("denied group termination records an explicit bounded failure and refuses live recovery", async () => {
+  const root = temporaryRoot();
+  const preload = path.join(root, "deny-group-kill.mjs");
+  fs.writeFileSync(
+    preload,
+    `const kill = process.kill;
+process.kill = function(pid, signal) {
+  if (pid < 0 && signal === "SIGKILL")
+    throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+  return kill.call(process, pid, signal);
+};`,
+  );
+  const previous = process.env.NODE_OPTIONS;
+  process.env.NODE_OPTIONS = `--import=${preload}`;
+  const abort = new AbortController();
+  try {
+    const failure = assert.rejects(
+      executeProcess(
+        root,
+        process.execPath,
+        [
+          "-e",
+          "require('node:fs').writeFileSync('started.json', '{}'); setInterval(() => {}, 1000)",
+        ],
+        abort.signal,
+      ),
+      /termination failed: kill EPERM.*cleanup is unresolved/,
+    );
+    await waitUntil(() => fs.existsSync(path.join(root, "started.json")));
+    abort.abort();
+    await failure;
+    const receipt = readJson(path.join(root, "exit.json"));
+    assert.match(receipt.error, /EPERM/);
+    assert.notEqual(receipt.code, 0);
+    assert.throws(() => assertAttemptStopped(root, true), /still active/);
+    assert(!fs.existsSync(path.join(root, "recovery.json")));
+  } finally {
+    abort.abort();
+    if (previous === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = previous;
+    const file = path.join(root, "cli.json");
+    if (fs.existsSync(file)) {
+      const group = ownerSchema.parse(readJson(file));
+      if (isAlive(group)) process.kill(-group.pid, "SIGKILL");
+      await waitUntil(() => !isGroupAlive(group.pid));
+    }
     fs.rmSync(root, { recursive: true });
   }
 });

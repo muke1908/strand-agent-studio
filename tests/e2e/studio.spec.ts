@@ -3,6 +3,7 @@ import type { Page } from "@playwright/test";
 import fs from "node:fs";
 import path from "node:path";
 import { unzipSync, strFromU8 } from "fflate";
+import type { QueueState, Run } from "../../shared/contracts.ts";
 import { temporaryRoot, workflow } from "../helpers.ts";
 
 const test = base.extend<{ instructionFile: string }>({
@@ -37,6 +38,286 @@ async function chooseInstructionFile(page: Page, file: string) {
     .getByRole("button", { name: path.basename(file), exact: true })
     .click();
 }
+
+test("workflow queue setting persists and launches appear in Queue history", async ({
+  page,
+}) => {
+  const definition = workflow(`queue-ui-${crypto.randomUUID().slice(0, 8)}`);
+  definition.name = `Queued browser workflow ${definition.id}`;
+  const created = await page.request.put(`/api/pipelines/${definition.id}`, {
+    data: { value: definition },
+  });
+  await expect(created).toBeOK();
+  await page.goto(`/pipelines/${definition.id}`);
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const checkbox = page.getByRole("checkbox", { name: "Queued", exact: true });
+  await expect(checkbox).not.toBeChecked();
+  await checkbox.check();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(
+    page.getByText("All changes saved", { exact: false }),
+  ).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(checkbox).toBeChecked();
+  await page.getByRole("button", { name: "Close inspector" }).click();
+  await page.getByRole("link", { name: "Run", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Add to queue", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("textbox", { name: "context*", exact: true })
+    .fill("Check shared scheduling.");
+  await page.getByRole("button", { name: "Add to queue", exact: true }).click();
+  await expect(page).toHaveURL(/\/runs\/run-/);
+  const id = page.url().split("/").at(-1);
+  await expect
+    .poll(async () => {
+      const response = await page.request.get(`/api/pipeline-runs/${id}`);
+      const run: Run = await response.json();
+      expect(run.queued).toBe(true);
+      return run.status;
+    })
+    .toBe("completed");
+  await page
+    .getByRole("navigation")
+    .getByRole("link", { name: "Queue", exact: true })
+    .click();
+  const row = page
+    .getByRole("region", { name: "Queue history" })
+    .getByRole("link")
+    .filter({ hasText: definition.name });
+  await expect(row).toHaveAttribute("href", `/runs/${id}`);
+  await expect(row).toContainText("completed");
+  await expect(row).toContainText("Manual run");
+  await row.click();
+  await expect(page).toHaveURL(new RegExp(`/runs/${id}$`));
+  await page.goto(`/pipelines/${definition.id}`);
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await checkbox.uncheck();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(
+    page.getByText("All changes saved", { exact: false }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: "Run", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Run workflow", exact: true }),
+  ).toBeVisible();
+});
+
+test("Queue history shows mixed statuses, polls updates and exposes empty and error states", async ({
+  page,
+}) => {
+  let failed = false;
+  const data: QueueState = {
+    pending: 32,
+    running: 1,
+    runs: Array.from({ length: 30 }, (_, index) => ({
+      id: `queue-history-${index}`,
+      workflowId: `workflow-${index}`,
+      workflowName: `Workflow ${index}`,
+      queued: true,
+      status: (
+        ["queued", "running", "completed", "blocked", "cancelled"] as const
+      )[index % 5],
+      createdAt: "2026-11-05T17:00:00.000Z",
+      updatedAt: "2026-11-05T17:00:00.000Z",
+      requestId: `queue-${index}`,
+      units: {},
+      ...(index === 1
+        ? {
+            trigger: {
+              watchId: "watch",
+              eventId: "1",
+              reason: "Scheduled check",
+            },
+          }
+        : {}),
+    })),
+  };
+  await page.route("**/api/queue", (route) =>
+    failed
+      ? route.fulfill({ status: 503, json: { error: "Queue unavailable" } })
+      : route.fulfill({ json: data }),
+  );
+  await page.goto("/queue");
+  const history = page.getByRole("region", { name: "Queue history" });
+  await expect(history.getByRole("link")).toHaveCount(30);
+  await expect(
+    page.getByText("32 pending · 1 running", { exact: true }),
+  ).toBeVisible();
+  const first = history.getByRole("link").first();
+  await expect(first).toHaveAttribute("href", "/runs/queue-history-0");
+  await expect(first).toContainText("pending");
+  await expect(history.getByRole("link").nth(1)).toContainText(
+    "Watch: Scheduled check",
+  );
+  for (const status of ["running", "completed", "blocked", "cancelled"])
+    await expect(
+      history.getByText(status, { exact: true }).first(),
+    ).toBeVisible();
+  data.runs[0].status = "completed";
+  await expect(first).toContainText("completed");
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth),
+  ).toBeLessThanOrEqual(390);
+  data.runs = [];
+  data.pending = 0;
+  data.running = 0;
+  await expect(
+    page.getByText("Nothing queued yet", { exact: true }),
+  ).toBeVisible();
+  failed = true;
+  await expect(page.getByRole("alert")).toHaveText("Queue unavailable");
+});
+
+test("show the latest 10 runs per workflow, refreshed independently by polling", async ({
+  page,
+}) => {
+  let runs: Run[] = Array.from({ length: 26 }, (_, index) => {
+    const workflowId =
+      index >= 24
+        ? "old-workflow"
+        : index % 2 === 0
+          ? "feature"
+          : "pr-assistant";
+    return {
+      id: `run-history-${index}`,
+      workflowId,
+      workflowName:
+        workflowId === "feature"
+          ? "Feature development"
+          : workflowId === "pr-assistant"
+            ? index === 19
+              ? "Old PR Assistant name"
+              : "PR Assistant"
+            : "Old workflow",
+      status: index === 0 ? "running" : "completed",
+      createdAt: new Date(Date.UTC(2026, 10, 4, 17, 30 - index)).toISOString(),
+      updatedAt: "2026-11-04T17:30:00Z",
+      requestId: `history-${index}`,
+      units: {},
+    };
+  });
+  await page.route("**/api/pipeline-runs", (route) =>
+    route.fulfill({ json: runs }),
+  );
+  await page.goto("/runs");
+  const history = page.getByRole("region", {
+    name: "Recent runs",
+    exact: true,
+  });
+  const feature = history.getByRole("region", {
+    name: "Feature development",
+    exact: true,
+  });
+  const assistant = history.getByRole("region", {
+    name: "PR Assistant",
+    exact: true,
+  });
+  const old = history.getByRole("region", {
+    name: "Old workflow",
+    exact: true,
+  });
+  await expect(history.getByRole("link")).toHaveCount(22);
+  await expect(history.getByRole("heading", { level: 2 })).toHaveText([
+    "Feature development",
+    "PR Assistant",
+    "Old workflow",
+  ]);
+  await expect(feature.getByRole("link")).toHaveCount(10);
+  await expect(assistant.getByRole("link")).toHaveCount(10);
+  await expect(old.getByRole("link")).toHaveCount(2);
+  await expect(feature.getByRole("link").first()).toHaveAttribute(
+    "href",
+    "/runs/run-history-0",
+  );
+  await expect(feature.getByRole("link").last()).toHaveAttribute(
+    "href",
+    "/runs/run-history-18",
+  );
+  await expect(assistant.getByRole("link").last()).toHaveAttribute(
+    "href",
+    "/runs/run-history-19",
+  );
+  await expect(feature.getByText("running", { exact: true })).toBeVisible();
+  await expect(history.locator('a[href="/runs/run-history-20"]')).toHaveCount(
+    0,
+  );
+  await expect(history.locator('a[href="/runs/run-history-21"]')).toHaveCount(
+    0,
+  );
+  runs = [
+    {
+      ...runs[1],
+      id: "run-history-new",
+      createdAt: "2026-11-04T17:31:00Z",
+      updatedAt: "2026-11-04T17:31:00Z",
+      trigger: {
+        watchId: "watch-history",
+        eventId: "new",
+        reason: "Scheduled run",
+      },
+    },
+    ...runs,
+  ];
+  await expect(assistant.getByRole("link").first()).toHaveAttribute(
+    "href",
+    "/runs/run-history-new",
+  );
+  await expect(history.getByRole("link")).toHaveCount(22);
+  await expect(feature.getByRole("link")).toHaveCount(10);
+  await expect(assistant.getByRole("link")).toHaveCount(10);
+  await expect(old.getByRole("link")).toHaveCount(2);
+  await expect(history.getByRole("heading", { level: 2 })).toHaveText([
+    "PR Assistant",
+    "Feature development",
+    "Old workflow",
+  ]);
+  await expect(history.locator('a[href="/runs/run-history-19"]')).toHaveCount(
+    0,
+  );
+  await expect(feature.getByRole("link").last()).toHaveAttribute(
+    "href",
+    "/runs/run-history-18",
+  );
+  await expect(assistant.getByRole("link").last()).toHaveAttribute(
+    "href",
+    "/runs/run-history-17",
+  );
+  await expect(
+    assistant.getByText("Scheduled run", { exact: true }),
+  ).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(feature.getByRole("heading")).toBeVisible();
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth),
+  ).toBeLessThanOrEqual(390);
+});
+
+test("run history keeps empty and API error states visible", async ({
+  page,
+}) => {
+  let failed = false;
+  await page.route("**/api/pipeline-runs", (route) =>
+    failed
+      ? route.fulfill({
+          status: 503,
+          json: { error: "Run history unavailable" },
+        })
+      : route.fulfill({ json: [] }),
+  );
+  await page.goto("/runs");
+  await expect(
+    page.getByRole("heading", { name: "No runs yet" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: "Explore workflows" }),
+  ).toHaveAttribute("href", "/pipelines");
+  failed = true;
+  await expect(page.getByRole("alert")).toHaveText("Run history unavailable");
+});
 
 test("configure a generic conditional loop and inspect immutable pass history and feedback", async ({
   page,
@@ -622,6 +903,9 @@ test("a blocked outcome stops execution and leaves later stages unexecuted", asy
   await expect(
     discover.getByRole("button", { name: "Rerun from Discover" }),
   ).toBeEnabled();
+  await expect(
+    discover.getByRole("button", { name: "Restart from Discover" }),
+  ).toBeEnabled();
   const report = page.getByRole("region", { name: "Report stage" });
   await expect(report).toHaveAccessibleDescription("Not executed");
   await expect(
@@ -629,6 +913,9 @@ test("a blocked outcome stops execution and leaves later stages unexecuted", asy
   ).toHaveCount(0);
   await expect(
     report.getByRole("button", { name: "Rerun from Report" }),
+  ).toBeDisabled();
+  await expect(
+    report.getByRole("button", { name: "Restart from Report" }),
   ).toBeDisabled();
   const stored = await (
     await page.request.get(`/api/pipeline-runs/${run.id}`)
@@ -638,6 +925,24 @@ test("a blocked outcome stops execution and leaves later stages unexecuted", asy
   expect(stored.units["@schema/report"]).toBeUndefined();
   expect(stored.units["report/writer"]).toBeUndefined();
   expect(stored.result).toBeUndefined();
+  page.once("dialog", async (dialog) => {
+    expect(dialog.message()).toContain("Latest compatible instructions");
+    await dialog.accept();
+  });
+  const restarting = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      request.url().endsWith(`/pipeline-runs/${run.id}/rerun`),
+  );
+  await discover.getByRole("button", { name: "Restart from Discover" }).click();
+  expect((await restarting).postDataJSON()).toMatchObject({
+    stageId: "discover",
+    latestInstructions: true,
+  });
+  await expect(page).not.toHaveURL(new RegExp(`/runs/${run.id}$`));
+  await expect(page.getByRole("alert")).toContainText(
+    'reported status "blocked"',
+  );
 });
 
 test("saving prevents inspector and canvas edits from being silently discarded", async ({

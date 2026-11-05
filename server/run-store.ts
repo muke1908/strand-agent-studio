@@ -59,6 +59,9 @@ const runSchema: z.ZodType<Run> = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
   requestId: z.string(),
+  queued: z.boolean().optional(),
+  queueOrder: z.number().int().nonnegative().optional(),
+  enqueuedAt: z.string().datetime().optional(),
   allowAllTools: z.boolean().optional(),
   allowedFolders: allowedFoldersSchema.optional(),
   error: z.string().optional(),
@@ -80,7 +83,12 @@ const runSchema: z.ZodType<Run> = z.object({
   stageSkips: z.array(stageSkipSchema).optional(),
   result: jsonValue.optional(),
   trigger: z
-    .object({ watchId: z.string(), eventId: z.string(), reason: z.string() })
+    .object({
+      watchId: z.string(),
+      eventId: z.string(),
+      reason: z.string(),
+      role: z.enum(["check", "action"]).optional(),
+    })
     .optional(),
   units: z.record(z.string(), unitSchema),
 });
@@ -95,6 +103,7 @@ const snapshotSchema = z.object({
   stageSkips: z.array(stageSkipSchema).optional(),
   continuation: continuationSchema
     .extend({
+      latestInstructions: z.boolean().optional(),
       checkpoints: z.array(stageCheckpointSchema),
       history: z.record(
         z.string(),
@@ -109,6 +118,14 @@ const snapshotSchema = z.object({
 });
 type Snapshot = z.infer<typeof snapshotSchema>;
 const manifestSchema = z.record(z.string(), z.string());
+
+export function compareQueueOrder(a: Run, b: Run): number {
+  return (
+    (a.queueOrder ?? 0) - (b.queueOrder ?? 0) ||
+    a.createdAt.localeCompare(b.createdAt) ||
+    a.id.localeCompare(b.id)
+  );
+}
 
 export function createRunStore(root: string) {
   privateDirectory(root);
@@ -125,6 +142,23 @@ export function createRunStore(root: string) {
   function save(run: Run): void {
     run.updatedAt = new Date().toISOString();
     writeJson(path.join(directory(run.id), "state.json"), run);
+  }
+  function list(): Run[] {
+    const base = path.join(root, "runs");
+    if (!fs.existsSync(base)) return [];
+    return fs
+      .readdirSync(base)
+      .filter((id) => fs.existsSync(path.join(base, id, "state.json")))
+      .map(get)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+  function enqueue(run: Run): void {
+    run.queueOrder =
+      list().reduce((order, item) => Math.max(order, item.queueOrder ?? 0), 0) +
+      1;
+    run.enqueuedAt = new Date().toISOString();
+    run.status = "queued";
+    save(run);
   }
   function artifact(id: string, name: string, value: unknown): void {
     if (!/^[a-zA-Z0-9_-]+\.json$/.test(name))
@@ -174,15 +208,8 @@ export function createRunStore(root: string) {
         throw new Error(`Uncommitted artifact requires recovery: ${name}`);
       return undefined;
     },
-    list(): Run[] {
-      const base = path.join(root, "runs");
-      if (!fs.existsSync(base)) return [];
-      return fs
-        .readdirSync(base)
-        .filter((id) => fs.existsSync(path.join(base, id, "state.json")))
-        .map(get)
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    },
+    list,
+    enqueue,
     create(
       workflow: Workflow,
       skills: Skill[],
@@ -206,6 +233,7 @@ export function createRunStore(root: string) {
         createdAt: time,
         updatedAt: time,
         requestId,
+        queued: workflow.queued ?? false,
         allowAllTools,
         units: {},
         ...(recovery?.stageSkips?.length
@@ -235,7 +263,7 @@ export function createRunStore(root: string) {
         allowAllTools,
         ...recovery,
       });
-      save(run);
+      enqueue(run);
       return run;
     },
     snapshot: (id: string): Snapshot =>

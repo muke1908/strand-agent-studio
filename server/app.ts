@@ -8,6 +8,7 @@ import {
   skillSchema,
   workflowSchema,
   watchSchema,
+  watchRegistrationSchema,
 } from "../shared/contracts.ts";
 import type { RunDetails, WatchDashboardItem } from "../shared/contracts.ts";
 import type { Catalog } from "./catalog.ts";
@@ -126,6 +127,9 @@ export function createApp(
   app.get("/api/pipeline-runs", (_request, response) =>
     response.json(host.store.list()),
   );
+  app.get("/api/queue", (_request, response) =>
+    response.json(host.queueState()),
+  );
   app.get("/api/pipeline-runs/:id", (request, response) => {
     host.store.verify(request.params.id);
     const run: RunDetails = {
@@ -164,12 +168,21 @@ export function createApp(
       .object({
         stageId: identifier,
         requestId: z.string().min(1).max(160),
+        latestInstructions: z.boolean().optional(),
       })
       .strict()
       .parse(request.body);
     response
       .status(202)
-      .json(host.rerun(request.params.id, body.stageId, body.requestId));
+      .json(
+        host.rerun(
+          request.params.id,
+          body.stageId,
+          body.requestId,
+          undefined,
+          body.latestInstructions,
+        ),
+      );
   });
   app.post("/api/pipeline-runs/:id/skip", (request, response) => {
     const body = z
@@ -181,14 +194,12 @@ export function createApp(
       })
       .strict()
       .parse(request.body);
-    response
-      .status(202)
-      .json(
-        host.rerun(request.params.id, body.stageId, body.requestId, {
-          reason: body.reason,
-          allowPublication: body.allowPublication,
-        }),
-      );
+    response.status(202).json(
+      host.rerun(request.params.id, body.stageId, body.requestId, {
+        reason: body.reason,
+        allowPublication: body.allowPublication,
+      }),
+    );
   });
   app.post("/api/pipeline-runs/:id/result-summary", (request, response) => {
     z.object({})
@@ -265,16 +276,42 @@ export function createApp(
     });
     response.json(items);
   });
-  app.put("/api/pipeline-watches/:id", (request, response) => {
+  app.put("/api/pipeline-watches/:id", async (request, response) => {
     const body = z
-      .object({ value: watchSchema, revision: z.string().optional() })
+      .object({
+        value: watchRegistrationSchema,
+        revision: z.string().optional(),
+      })
       .parse(request.body);
     if (body.value.id !== request.params.id)
       throw Object.assign(new Error("Watch identity cannot change"), {
         status: 400,
       });
-    watcher.validate(body.value);
-    response.json(catalog.saveWatch(body.value, body.revision));
+    const action = body.value.action;
+    if (action && !("conditions" in action)) {
+      if (
+        body.revision !== undefined ||
+        catalog.watches().some((item) => item.value.id === body.value.id)
+      )
+        throw Object.assign(
+          new Error("Create a new watch to change its action or condition."),
+          { status: 409 },
+        );
+      watcher.validate(watchSchema.parse({ ...body.value, action: undefined }));
+    }
+    const value = watchSchema.parse({
+      ...body.value,
+      action:
+        action && !("conditions" in action)
+          ? await host.compileWatchAction(
+              body.value.workflowId,
+              action,
+              body.value.inputBindings,
+            )
+          : action,
+    });
+    watcher.validate(value);
+    response.json(catalog.saveWatch(value, body.revision));
   });
   app.use("/api", (_request, response) =>
     response.status(404).json({ error: "API endpoint not found" }),

@@ -28,7 +28,7 @@ Open **http://localhost:4200**.
 
 Saved personal workflows, linked agent instructions, and shared skills live in the separate private [strand-workflows](https://github.com/mukeshbiswas_microsoft/strand-workflows) repository. Local run history and runtime state are not included in either repository.
 
-Install and authenticate the GitHub Copilot CLI before running real agents. If it is not on your PATH, set `COPILOT_BIN` to its executable or JavaScript entry point. Settings reports backend availability; unavailable execution fails explicitly rather than fabricating results.
+Install and authenticate the GitHub Copilot CLI before running real agents. If it is not on your PATH, set `COPILOT_BIN` to its executable or JavaScript entry point. All Copilot calls default to `gpt-6-astra`, including workflow agents, schema generation, result summaries and watch-condition compilation; an explicit agent model overrides this default. Settings reports backend availability; unavailable execution fails explicitly rather than fabricating results.
 
 The launcher checks the bundled CLI with auto-update disabled, just as it executes it. Optional folder-trust and client-telemetry flags are used only when supported; older versions disable history export with `--no-remote-export`. If client telemetry cannot be disabled, diagnostics and server logs report that limitation. Missing required execution or history controls block execution.
 
@@ -62,6 +62,12 @@ These screenshots use an isolated workspace with starter workflows and explicitl
 
 **Runs:** launch from a saved workflow. Simple schemas generate input forms; complex schemas use a validated JSON editor. See agent activity, results and process logs. Stop active execution or resume a blocked/cancelled run without replacing its pinned input, skills, workflow, backend or accepted contracts.
 
+**Queue:** enable **Queued** in the workflow builder to put its runs in one shared FIFO lane, with only one queued workflow running at a time. Unchecked workflows can run in parallel within the host's concurrency limit. The Queue page shows the latest 30 queue submissions and their status. Watches avoid duplicate submissions while their workflow is queued or running.
+
+**Restart a stage:** blocked/cancelled stage cards can restart with the latest compatible instructions in a new continuation, reusing completed earlier handoffs. Structural or permission changes require a new launch instead. Interrupted attempts with missing exit receipts are recoverable only after their recorded processes are confirmed stopped; their unknown outcomes remain explicitly recorded rather than treated as successful.
+
+**Download assets:** completed runs include accepted outputs and execution logs, plus files referenced by absolute paths anywhere in every final-stage agent's output, even when the workflow selects only one agent's result. These files appear under `outputs/<stage>-<agent>/<folder-number>/`, preserving paths relative to that agent's pinned allowed folder. Directories are not recursively exported, and references outside the grants are not included. Missing referenced files and symbolic links fail the download explicitly. Existing `report: { path, sha256 }` publications remain checksum-verified under `reports/`; other referenced files are read at download time.
+
 **Allow all tools:** the launch checkbox is off by default. Enable it to expose the CLI's web, shell and configured MCP tools, automatically approve tool use and URLs, and remove the supplied-context-only prompt restrictions. The choice is pinned for every agent attempt, including schema preparation and resume, and displayed on the run page. It does not grant all filesystem paths or configure missing MCP servers. Only enable it for trusted workflows; tools may modify files or external services. Existing runs and watches remain restricted.
 
 **Allowed folders:** select an individual agent in the workflow builder and enter existing absolute directory paths, one per line. Strand resolves symlinks, removes duplicates, saves the grants in that agent's configuration, and pins them when a run starts. Only that agent's Copilot subprocess receives its grants via `--add-dir`; other agents and schema preparation do not inherit them. Resumed attempts keep their original permissions. Inspect an activity card's Input to see its pinned folders. File tools may read and modify granted folders even without **Allow all tools**; shell and network tools still require that checkbox. Use trusted folders only: Copilot may load their `.github/skills` and `.github/agents` as trusted configuration. OS and managed CLI policies still apply. Leaving an agent's field empty adds no grants. Watches use the saved per-agent permissions for fresh runs. Historical runs retain their original run-wide grants; new launches cannot request run-wide folder access.
@@ -69,6 +75,40 @@ These screenshots use an isolated workspace with starter workflows and explicitl
 **Watches:** register a cron schedule with a time zone, or an Azure DevOps PR-source policy. Configure explicit trigger-to-input bindings, cooldown and hourly limits. The first observation establishes a baseline without launching. Later changes admit fresh runs. Pending changes coalesce by resource while the workflow is active. Pause/enable watches from the gallery.
 
 Watch source, workflow and input bindings are immutable after registration: create a new watch to change them. Names, enablement and limits remain editable. Provider errors are visible and preserve the last cursor. There is no automatic failed-run retry loop.
+
+**Check → condition → action watches:** enable the optional action in the watch editor, choose an **Action workflow**, and describe **When to run** in plain language—for example, “Run when there are open comments and the last comment is more than 30 minutes old.” AI compiles that sentence into fixed rules **once when saving**. Scheduled checks evaluate the saved rules without another AI call. Matching input names carry over from the check to the action; missing required inputs, unsupported conditions, and fields absent from the check's declared result are explicit errors and prevent registration. Existing structured watches retain their saved rules; action settings remain immutable after registration.
+
+The API also accepts explicit `action` conditions, input bindings and `recheckSeconds` (default 600). All conditions must match. JSON Pointer comparisons support `equals`, `notEquals`, `greaterThan`, `greaterThanOrEqual`, `lessThan`, `lessThanOrEqual` and `olderThanSeconds` (strictly older than the given seconds, using a timezone-qualified timestamp). Missing fields, invalid timestamps and incompatible comparison types are visible errors, not qualifying results. Conditions short-circuit in order, so put readiness/null guards first.
+
+Action bindings use `source: "trigger"` for the check's selected result, `source: "input"` for its original input, or literals. An optional `deduplicationPointer` selects a stable result revision: a successful action consumes that revision for the trigger resource, surviving restart; a blocked/cancelled action does not. The check workflow owns domain-specific revision semantics, such as excluding its action's own replies. Without that pointer, every qualifying check can launch an action.
+
+For example, the optional action below launches an existing workflow only when a check reports ready, positive work and more than 30 minutes of quiet. These are illustrative workflow IDs/fields, not a registered watch:
+
+```json
+{
+  "workflowId": "handle-work",
+  "conditions": [
+    { "pointer": "/status", "operator": "equals", "value": "ready" },
+    { "pointer": "/openCount", "operator": "greaterThan", "value": 0 },
+    {
+      "pointer": "/lastPostedAt",
+      "operator": "olderThanSeconds",
+      "value": 1800
+    }
+  ],
+  "inputBindings": {
+    "resourceUrl": { "source": "input", "pointer": "/resourceUrl" }
+  },
+  "deduplicationPointer": "/reviewRevision",
+  "recheckSeconds": 600
+}
+```
+
+Check/action watches suspend checks while either workflow is queued/running, and track their exact run IDs. Both participating workflows are single-active-run across watches, manual launches, Resume and reruns, even while the watch is manually paused. Busy admission returns a conflict rather than queuing an overlapping run. This is workflow-level serialization, not a cross-workflow workspace or external-process lock. Busy checks and launch are atomic under the host's admission claim; deterministic request IDs reconcile launches interrupted by restart.
+
+Success, blocked/cancelled execution and completed waits all schedule a fresh check after `recheckSeconds`; no missed-event backlog is replayed. A check older than that interval cannot launch an action. Failures stay visible until a later check progresses. Cooldown and hourly budgets apply separately to check and action launches. Manual Pause always wins and is never automatically toggled. Action configuration is immutable after registration. No PR-specific watcher or workflow is created by enabling this platform capability.
+
+Use retry-safe action instructions and side-effect receipts: automatic fresh runs after failures do not themselves make external mutations idempotent.
 
 The starter workflows—bug triage, change review and document audit—analyze **supplied context**. They do not retrieve issues or implement the previous application's operational PR-review flow.
 
@@ -126,7 +166,7 @@ This initial project is a **local execution foundation**, not a complete deploym
 
 CLI permissions and prompts are **not an OS sandbox**. Only run trusted instructions and locally authorized context; file-write tools remain available to create outputs. Do not expose this server publicly. Local host/origin checks are not authentication. Agent execution sends supplied context to the configured Copilot service. The supervisor currently requires POSIX process identity and process groups (macOS/Linux).
 
-Watches poll every minute, with a longer delay after provider errors. The host admits at most two simultaneous runs and bounds each run to 30 minutes. Watcher lookup uses host code, not arbitrary user scripts.
+Watches poll every minute, with a longer delay after provider errors. The host admits at most two simultaneous runs. Runs and AI result summaries have no wall-clock deadline; agents can keep working until they finish, fail, or are cancelled. Stop and host shutdown still cancel owned processes. A hung agent requires manual intervention; subprocess startup/cleanup and provider-request safety limits remain in place. Watcher lookup uses host code, not arbitrary user scripts.
 
 ## Validate
 

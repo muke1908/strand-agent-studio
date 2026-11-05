@@ -11,8 +11,79 @@ import { createWatcher } from "../server/watcher.ts";
 import { createApp } from "../server/app.ts";
 import { fixtureBackend } from "../server/fixture-backend.ts";
 import { executeRun } from "../server/run-engine.ts";
+import { runAssets } from "../server/run-assets.ts";
 import { temporaryRoot, workflow, waitForRun } from "./helpers.ts";
-import type { WatchDashboardItem } from "../shared/contracts.ts";
+import type { QueueState, WatchDashboardItem } from "../shared/contracts.ts";
+
+test("queue API returns the latest 30 participating submissions and counts older pending runs", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const backend = fixtureBackend();
+  const host = createRunHost(root, catalog, backend);
+  const watcher = createWatcher(root, catalog, host, []);
+  const server = createApp(catalog, host, watcher, backend).listen(
+    0,
+    "127.0.0.1",
+  );
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const origin = `http://127.0.0.1:${address.port}`;
+  try {
+    const read = async (): Promise<QueueState> => {
+      const response = await fetch(`${origin}/api/queue`);
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    assert.deepEqual(await read(), { runs: [], pending: 0, running: 0 });
+    const definition = { ...workflow(), queued: true };
+    const runs = Array.from({ length: 33 }, (_, index) => {
+      const run = host.store.create(
+        definition,
+        [],
+        { context: "Queue history" },
+        `queue-${index}`,
+        backend.id,
+      );
+      run.status =
+        index < 2
+          ? "queued"
+          : index === 32
+            ? "running"
+            : (["completed", "blocked", "cancelled"] as const)[index % 3];
+      host.store.save(run);
+      return run;
+    });
+    host.store.create(
+      workflow("parallel"),
+      [],
+      { context: "Not a serial submission" },
+      "parallel",
+      backend.id,
+    );
+    const queue = await read();
+    assert.equal(queue.pending, 2);
+    assert.equal(queue.running, 1);
+    assert.deepEqual(
+      queue.runs.map((run) => run.id),
+      runs
+        .slice(3)
+        .reverse()
+        .map((run) => run.id),
+    );
+    assert(queue.runs.every((run) => run.queued));
+    assert.deepEqual(
+      new Set(queue.runs.map((run) => run.status)),
+      new Set(["running", "completed", "blocked", "cancelled"]),
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
 
 test("watch dashboard retains each watch's previous output until its next scheduled result", async () => {
   const root = temporaryRoot();
@@ -315,6 +386,117 @@ test("completed run downloads include verified reports and execution assets, not
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
     );
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("downloads include every final agent's nested file references without a report contract", async () => {
+  const root = temporaryRoot();
+  const reports = path.join(fs.realpathSync(root), "reports");
+  fs.mkdirSync(path.join(reports, "nested"), { recursive: true });
+  const report = path.join(reports, "findings.md");
+  const diagram = path.join(reports, "diagrams.md");
+  const nested = path.join(reports, "nested", "findings.md");
+  const outside = path.join(fs.realpathSync(root), "source.ts");
+  fs.writeFileSync(report, "# Findings");
+  fs.writeFileSync(diagram, "```mermaid\nflowchart TD\nA --> B\n```");
+  fs.writeFileSync(nested, "# Supporting findings");
+  fs.writeFileSync(outside, "Unrelated source");
+  fs.writeFileSync(path.join(reports, "unreferenced.md"), "Not an output");
+  const definition = workflow();
+  definition.stages[1].agents = [
+    { id: "writer", name: "Writer", allowedFolders: [reports] },
+    { id: "diagram", name: "Diagram", allowedFolders: [reports] },
+  ];
+  definition.result = {
+    source: "stage",
+    stageId: "report",
+    agentId: "writer",
+    pointer: "",
+  };
+  const fixture = fixtureBackend();
+  const backend: AgentBackend = {
+    ...fixture,
+    async execute(request, signal) {
+      if (request.purpose === "stage") {
+        if (path.basename(request.directory).startsWith("report-writer-"))
+          return {
+            summary: "Findings",
+            reportArtifact: { reportPath: report },
+            evidence: [{ paths: [nested, report, outside] }],
+            workspace: reports,
+          };
+        if (path.basename(request.directory).startsWith("report-diagram-"))
+          return {
+            summary: "Diagrams",
+            diagramArtifacts: { paths: [diagram] },
+          };
+      }
+      return fixture.execute(request, signal);
+    },
+  };
+  const catalog = createCatalog(root);
+  catalog.saveWorkflow(definition);
+  const host = createRunHost(root, catalog, backend);
+  try {
+    const started = host.launch(
+      definition.id,
+      { context: "Final artifacts" },
+      "final-artifacts",
+    );
+    const run = await waitForRun(() => host.store.get(started.id));
+    assert.equal(run.status, "completed", run.error);
+    const archive = unzipSync(runAssets(host.store, run.id));
+    assert.equal(
+      strFromU8(archive["outputs/report-writer/1/findings.md"]),
+      "# Findings",
+    );
+    assert.equal(
+      strFromU8(archive["outputs/report-writer/1/nested/findings.md"]),
+      "# Supporting findings",
+    );
+    assert.equal(
+      strFromU8(archive["outputs/report-diagram/1/diagrams.md"]),
+      fs.readFileSync(diagram, "utf8"),
+    );
+    assert.deepEqual(
+      Object.keys(archive)
+        .filter((name) => name.startsWith("outputs/"))
+        .sort(),
+      [
+        "outputs/report-diagram/1/diagrams.md",
+        "outputs/report-writer/1/findings.md",
+        "outputs/report-writer/1/nested/findings.md",
+      ],
+    );
+    assert(archive["execution/result.json"]);
+    assert(
+      !Object.keys(archive).some((name) =>
+        /source\.ts|unreferenced/.test(name),
+      ),
+    );
+
+    fs.unlinkSync(report);
+    fs.symlinkSync(outside, report);
+    assert.throws(() => runAssets(host.store, run.id), /symbolic links/);
+    fs.unlinkSync(report);
+    fs.writeFileSync(report, "# Findings");
+    fs.unlinkSync(nested);
+    fs.rmdirSync(path.dirname(nested));
+    fs.symlinkSync(path.dirname(outside), path.dirname(nested));
+    fs.writeFileSync(
+      path.join(path.dirname(outside), "findings.md"),
+      "Outside",
+    );
+    assert.throws(
+      () => runAssets(host.store, run.id),
+      /outside.*pinned allowed folders/,
+    );
+    fs.unlinkSync(path.dirname(nested));
+    fs.mkdirSync(path.dirname(nested));
+    assert.throws(() => runAssets(host.store, run.id), /ENOENT/);
+  } finally {
+    await host.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

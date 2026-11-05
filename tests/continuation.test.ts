@@ -622,7 +622,7 @@ test("stage admission rejects active sources, incomplete prefixes, orphan proces
     });
     assert.throws(
       () => host.rerun(source.id, "report", "orphan"),
-      /still active or has an unresolved process outcome/,
+      /Cannot restart.*still active/,
     );
     fs.unlinkSync(wrapper);
     host.rerun(source.id, "report", "competing-child");

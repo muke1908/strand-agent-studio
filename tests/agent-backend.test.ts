@@ -8,6 +8,7 @@ import { temporaryRoot, workflow } from "./helpers.ts";
 
 const commonOptions = [
   "--prompt",
+  "--model",
   "--no-ask-user",
   "--no-custom-instructions",
   "--disable-builtin-mcps",
@@ -20,13 +21,13 @@ const commonOptions = [
   "--log-dir",
 ];
 
-for (const [modern, allowAllTools] of [
-  [false, false],
-  [true, false],
-  [false, true],
-  [true, true],
-]) {
-  test(`Copilot launch uses ${modern ? "modern" : "legacy"} bundled options with ${allowAllTools ? "all" : "restricted"} tools`, async () => {
+for (const [modern, allowAllTools, model] of [
+  [false, false, undefined],
+  [true, false, "gpt-6-sol"],
+  [false, true, undefined],
+  [true, true, "gpt-6-sol"],
+] as const) {
+  test(`Copilot launch uses ${modern ? "modern" : "legacy"} bundled options with ${allowAllTools ? "all" : "restricted"} tools and ${model ?? "default GPT Astra"}`, async () => {
     const root = temporaryRoot();
     const folderRoot = temporaryRoot();
     const folder = path.join(folderRoot, "project with spaces");
@@ -74,6 +75,7 @@ if (args.includes("--help")) {
             schema: { type: "object" },
             purpose: "stage",
             input: {},
+            model,
             allowAllTools,
             allowedFolders,
           },
@@ -92,6 +94,12 @@ if (args.includes("--help")) {
       assert(args.includes("--no-auto-update"));
       assert(args.includes("--no-custom-instructions"));
       assert(args.includes("--allow-all-tools"));
+      assert.deepEqual(
+        args.flatMap((arg, index) =>
+          arg === "--model" ? [args[index + 1]] : [],
+        ),
+        [model ?? "gpt-6-astra"],
+      );
       assert.equal(args.includes("--available-tools"), !allowAllTools);
       assert.equal(args.includes("--disable-builtin-mcps"), !allowAllTools);
       assert.equal(args.includes("--allow-all-urls"), allowAllTools);
@@ -137,6 +145,39 @@ test("Copilot diagnostics reject missing required execution controls", () => {
     const diagnostics = copilotBackend().diagnostics();
     assert.equal(diagnostics.available, false);
     assert.match(diagnostics.reason || "", /missing.*--no-ask-user/);
+  } finally {
+    if (previous === undefined) delete process.env.COPILOT_BIN;
+    else process.env.COPILOT_BIN = previous;
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("Copilot refuses execution when the CLI cannot explicitly select the model", async () => {
+  const root = temporaryRoot();
+  const previous = process.env.COPILOT_BIN;
+  const script = path.join(root, "copilot.js");
+  fs.writeFileSync(
+    script,
+    `console.log(${JSON.stringify([...commonOptions.filter((option) => option !== "--model"), "--no-remote-export"].join("\n"))});`,
+  );
+  process.env.COPILOT_BIN = script;
+  try {
+    const backend = copilotBackend();
+    assert.equal(backend.diagnostics().available, false);
+    await assert.rejects(
+      backend.execute(
+        {
+          directory: root,
+          prompt: "Produce a summary.",
+          schema: { type: "object" },
+          purpose: "watch-condition",
+          input: {},
+        },
+        new AbortController().signal,
+      ),
+      /missing --model/,
+    );
+    assert.equal(fs.existsSync(path.join(root, "process-input.json")), false);
   } finally {
     if (previous === undefined) delete process.env.COPILOT_BIN;
     else process.env.COPILOT_BIN = previous;

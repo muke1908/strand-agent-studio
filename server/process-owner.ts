@@ -23,7 +23,24 @@ export function isAlive(owner: ProcessOwner): boolean {
     throw error;
   }
 
-  return processIdentity(owner.pid) === owner.identity;
+  try {
+    return processIdentity(owner.pid) === owner.identity;
+  } catch (error) {
+    if (error instanceof Error && "status" in error && error.status === 1) {
+      try {
+        process.kill(owner.pid, 0);
+      } catch (failure) {
+        if (
+          failure instanceof Error &&
+          "code" in failure &&
+          failure.code === "ESRCH"
+        )
+          return false;
+        throw failure;
+      }
+    }
+    throw error;
+  }
 }
 
 export function isGroupAlive(groupId: number): boolean {

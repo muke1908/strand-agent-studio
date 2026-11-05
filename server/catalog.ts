@@ -99,7 +99,10 @@ export function createCatalog(root: string) {
             { status: 409 },
           );
         const enabled = list("watches", watchSchema).filter(
-          (item) => item.value.workflowId === id && item.value.enabled,
+          (item) =>
+            (item.value.workflowId === id ||
+              item.value.action?.workflowId === id) &&
+            item.value.enabled,
         );
         if (enabled.length)
           throw Object.assign(
@@ -127,6 +130,7 @@ export function createCatalog(root: string) {
         policyId: watch.policyId,
         settings: watch.settings,
         inputBindings: watch.inputBindings,
+        action: watch.action ?? null,
       });
       if (previous && digest(source(previous)) !== digest(source(parsed)))
         throw Object.assign(

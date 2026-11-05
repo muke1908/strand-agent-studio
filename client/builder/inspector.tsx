@@ -100,6 +100,21 @@ export function Inspector({
                 }
               />
             </label>
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={workflow.queued ?? false}
+                onChange={(event) =>
+                  update({ ...workflow, queued: event.target.checked })
+                }
+                aria-describedby="workflow-queue-help"
+              />
+              Queued
+            </label>
+            <p className="muted" id="workflow-queue-help">
+              Run through the shared queue, one at a time. Unchecked workflows
+              can still run in parallel.
+            </p>
             <JsonEditor
               label="Launch input schema"
               value={workflow.inputSchema}

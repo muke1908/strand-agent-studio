@@ -9,7 +9,7 @@ export type AgentRequest = {
   directory: string;
   prompt: string;
   schema: Schema;
-  purpose: "schema" | "stage" | "summary";
+  purpose: "schema" | "stage" | "summary" | "watch-condition";
   input: Json;
   model?: string;
   allowAllTools?: boolean;
@@ -23,6 +23,7 @@ export interface AgentBackend {
 
 const requiredOptions = [
   "--prompt",
+  "--model",
   "--no-ask-user",
   "--no-custom-instructions",
   "--disable-builtin-mcps",
@@ -113,8 +114,6 @@ export function copilotBackend(): AgentBackend {
       const { command, prefix, options, historyOption, warnings } =
         invocation();
       for (const warning of warnings) console.warn(warning);
-      if (request.model && !options.has("--model"))
-        throw new Error("Installed Copilot CLI does not support --model.");
       if (request.allowAllTools && !options.has("--allow-all-urls"))
         throw new Error(
           "Installed Copilot CLI does not support --allow-all-urls.",
@@ -167,7 +166,8 @@ export function copilotBackend(): AgentBackend {
         "--allow-all-tools",
         "--log-dir",
         path.join(request.directory, "cli-logs"),
-        ...(request.model ? ["--model", request.model] : []),
+        "--model",
+        request.model ?? "gpt-6-astra",
       ];
       await executeProcess(request.directory, command, args, signal);
       return readOutput(outputFile);

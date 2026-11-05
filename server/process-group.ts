@@ -17,11 +17,31 @@ function groupWorker(file: string): void {
   function report(code: number | null, signal: string | null, error?: string) {
     if (reported) return;
     reported = true;
-    process.send?.({ type: "exit", code, signal, ...(error ? { error } : {}) });
+    if (process.connected)
+      process.send?.({
+        type: "exit",
+        code,
+        signal,
+        ...(error ? { error } : {}),
+      });
+  }
+  function stop() {
+    try {
+      process.kill(-process.pid, "SIGKILL");
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ESRCH")
+        return;
+      console.error(error);
+      report(
+        null,
+        null,
+        `Agent process-group termination failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   // Stay the group's identifiable leader until the supervisor cleans it up.
-  process.on("disconnect", () => process.kill(-process.pid, "SIGKILL"));
-  if (!process.connected) process.kill(-process.pid, "SIGKILL");
+  process.on("disconnect", stop);
+  if (!process.connected) stop();
   process.on("message", (value: unknown) => {
     if (
       started ||

@@ -120,6 +120,7 @@ export const workflowSchema = z
     id: identifier,
     name: z.string().min(1).max(120),
     description: z.string().max(2000).default(""),
+    queued: z.boolean().optional(),
     inputSchema: schema,
     stages: z.array(stageSchema).min(1).max(24),
     result: reference.optional(),
@@ -139,6 +140,33 @@ export const skillSchema = z
     instructions: z.string().min(1).max(50000),
   })
   .strict();
+export const watchActionRequestSchema = z
+  .object({
+    workflowId: identifier,
+    whenToRun: z.string().trim().min(1).max(2000),
+  })
+  .strict();
+export const watchActionSchema = z
+  .object({
+    workflowId: identifier,
+    whenToRun: z.string().trim().min(1).max(2000).optional(),
+    conditions: z
+      .array(
+        z
+          .object({
+            pointer: z.string(),
+            operator: z.enum([...loopOperators, "olderThanSeconds"]),
+            value: jsonValue,
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(20),
+    inputBindings: z.record(z.string(), reference),
+    deduplicationPointer: z.string().optional(),
+    recheckSeconds: z.number().int().min(1).max(86400).default(600),
+  })
+  .strict();
 export const watchSchema = z
   .object({
     id: identifier,
@@ -151,8 +179,13 @@ export const watchSchema = z
     allowAllTools: z.boolean().optional(),
     cooldownSeconds: z.number().int().min(0).max(86400).default(60),
     maxRunsPerHour: z.number().int().min(1).max(60).default(10),
+    action: watchActionSchema.optional(),
   })
   .strict();
+export const watchRegistrationSchema = watchSchema.extend({
+  action: z.union([watchActionSchema, watchActionRequestSchema]).optional(),
+});
+export type WatchActionRequest = z.infer<typeof watchActionRequestSchema>;
 export type Workflow = z.infer<typeof workflowSchema>;
 export type Stage = z.infer<typeof stageSchema>;
 export type Agent = z.infer<typeof agentSchema>;
@@ -215,9 +248,17 @@ export type Run = {
   createdAt: string;
   updatedAt: string;
   requestId: string;
+  queued?: boolean;
+  queueOrder?: number;
+  enqueuedAt?: string;
   allowAllTools?: boolean;
   allowedFolders?: string[];
-  trigger?: { watchId: string; eventId: string; reason: string };
+  trigger?: {
+    watchId: string;
+    eventId: string;
+    reason: string;
+    role?: "check" | "action";
+  };
   error?: string;
   currentStage?: string;
   units: Record<string, Unit>;
@@ -226,6 +267,11 @@ export type Run = {
   stageSkips?: StageSkip[];
   visits?: StageVisit[];
   currentVisit?: string;
+};
+export type QueueState = {
+  runs: Run[];
+  pending: number;
+  running: number;
 };
 export type ResultSummary =
   | { status: "generating" }
@@ -248,6 +294,15 @@ export type Decision = {
   status: "pending" | "launched" | "superseded" | "rejected";
   runId?: string;
   error?: string;
+  outcome?:
+    "skipped" | "duplicate" | "completed" | "blocked" | "cancelled" | "error";
+  outcomeReason?: string;
+  action?: {
+    requestId: string;
+    input: Json;
+    key?: string;
+    runId?: string;
+  };
 };
 export type WatchState = {
   id: string;
@@ -256,6 +311,8 @@ export type WatchState = {
   lastChecked?: string;
   error?: string;
   decisions: Decision[];
+  phase?: "watching" | "checking" | "acting" | "waiting";
+  activeRunId?: string;
 };
 export type WatchDashboardItem = Saved<Watch> & {
   state: WatchState;

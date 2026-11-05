@@ -39,11 +39,17 @@ export function PageHeader({
     </header>
   );
 }
-export function StatusBadge({ status }: { status: Status | string }) {
+export function StatusBadge({
+  status,
+  label = status,
+}: {
+  status: Status | string;
+  label?: string;
+}) {
   return (
     <span className={`status status-${status}`}>
       <i />
-      {status}
+      {label}
     </span>
   );
 }

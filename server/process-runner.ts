@@ -18,11 +18,22 @@ const exitSchema = z.object({
   error: z.string().optional(),
 });
 
-export function assertAttemptStopped(directory: string): void {
+const recoverySchema = z.object({
+  status: z.literal("interrupted-stopped"),
+  verifiedAt: z.string().datetime(),
+  owners: z.array(ownerSchema).length(2),
+});
+
+export function assertAttemptStopped(
+  directory: string,
+  recoverInterrupted = false,
+): void {
+  const owners = [];
   for (const name of ["wrapper.json", "cli.json"]) {
     const file = path.join(directory, name);
     if (fs.existsSync(file)) {
       const owner = ownerSchema.parse(readJson(file));
+      owners.push(owner);
       if (isAlive(owner) || (name === "cli.json" && isGroupAlive(owner.pid)))
         throw new Error(
           "A previous agent process or process group is still active",
@@ -33,8 +44,21 @@ export function assertAttemptStopped(directory: string): void {
     fs.existsSync(path.join(directory, "launch.json")) &&
     !fs.existsSync(path.join(directory, "exit.json"))
   ) {
+    const recoveryFile = path.join(directory, "recovery.json");
+    if (fs.existsSync(recoveryFile)) {
+      const recovery = recoverySchema.parse(readJson(recoveryFile));
+      if (JSON.stringify(recovery.owners) === JSON.stringify(owners)) return;
+    }
+    if (recoverInterrupted && owners.length === 2) {
+      writeJson(recoveryFile, {
+        status: "interrupted-stopped",
+        verifiedAt: new Date().toISOString(),
+        owners,
+      });
+      return;
+    }
     throw new Error(
-      "Previous process outcome is unknown; resolve it before resuming",
+      "Previous process outcome is unknown. Restart the stage to verify stopped processes and create a fresh attempt.",
     );
   }
 }
@@ -115,7 +139,14 @@ export async function executeProcess(
             ),
           );
       } catch (error) {
-        reject(error);
+        reject(
+          error instanceof Error && "code" in error && error.code === "ENOENT"
+            ? new Error(
+                `Agent supervisor exited ${code}/${exitSignal || ""} without a termination receipt. Restart the stage after its processes are confirmed stopped.`,
+                { cause: error },
+              )
+            : error,
+        );
       }
     });
   });
@@ -149,9 +180,12 @@ function worker(file: string): void {
         }
       } catch (failure) {
         console.error(failure);
-        process.exitCode = 1;
-        if (process.connected) process.disconnect();
-        return;
+        error = [
+          error,
+          failure instanceof Error ? failure.message : String(failure),
+        ]
+          .filter(Boolean)
+          .join("; ");
       }
     }
     writeJson(path.join(request.directory, "exit.json"), {
@@ -160,7 +194,36 @@ function worker(file: string): void {
       ...(error ? { error } : {}),
     });
     process.exitCode = code === 0 && !error ? 0 : 1;
+    if (group?.connected) group.disconnect();
+    group?.unref();
     if (process.connected) process.disconnect();
+  }
+  function terminateGroup() {
+    try {
+      const owner = ownerSchema.parse(
+        readJson(path.join(request.directory, "cli.json")),
+      );
+      if (isAlive(owner)) process.kill(-owner.pid, "SIGKILL");
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ESRCH")
+        return;
+      void finish(
+        null,
+        null,
+        `${stopped ? "Agent cancelled; " : ""}Agent process-group termination failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  function terminateUnregisteredGroup() {
+    try {
+      group?.kill("SIGKILL");
+    } catch (error) {
+      void finish(
+        null,
+        null,
+        `Agent registration and termination failed: ${registrationError}; ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   function stop() {
     stopped = true;
@@ -169,13 +232,10 @@ function worker(file: string): void {
       return;
     }
     if (registrationError) {
-      group.kill("SIGKILL");
+      terminateUnregisteredGroup();
       return;
     }
-    const owner = ownerSchema.parse(
-      readJson(path.join(request.directory, "cli.json")),
-    );
-    if (isAlive(owner)) process.kill(-owner.pid, "SIGKILL");
+    terminateGroup();
   }
   process.on("disconnect", () => {
     if (!finished) stop();
@@ -211,10 +271,7 @@ function worker(file: string): void {
         else group?.send({ type: "start" });
       } else if (message.type === "exit") {
         result = exitSchema.parse(message);
-        const owner = ownerSchema.parse(
-          readJson(path.join(request.directory, "cli.json")),
-        );
-        if (isAlive(owner)) process.kill(-owner.pid, "SIGKILL");
+        terminateGroup();
       }
     });
     group.once("error", (error) => void finish(null, null, error.message));
@@ -240,7 +297,7 @@ function worker(file: string): void {
       } catch (error) {
         registrationError =
           error instanceof Error ? error.message : String(error);
-        group.kill("SIGKILL");
+        terminateUnregisteredGroup();
       }
     }
   });

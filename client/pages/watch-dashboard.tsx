@@ -9,6 +9,7 @@ import {
   PageHeader,
   StatusBadge,
 } from "../components.tsx";
+import { WatchTiming } from "../watch-timing.tsx";
 
 function WatchOutput({ output }: { output: Json }) {
   const record =
@@ -95,16 +96,25 @@ export function WatchDashboard() {
                   <header className="watch-result-title">
                     <h2 id={`watch-title-${watch.id}`}>{watch.name}</h2>
                     <StatusBadge
-                      status={watch.enabled ? "watching" : "paused"}
+                      status={
+                        watch.enabled ? (state.phase ?? "watching") : "paused"
+                      }
                     />
                   </header>
-                  <p>{watch.workflowId}</p>
-                  {watch.policyId === "schedule-cron" && (
-                    <p className="watch-meta">
-                      Schedule: <code>{String(watch.settings.expression)}</code>{" "}
-                      ({String(watch.settings.timeZone)})
-                    </p>
-                  )}
+                  <p>
+                    {watch.workflowId}
+                    {watch.action && ` → ${watch.action.workflowId}`}
+                  </p>
+                  <WatchTiming watch={watch} state={state} />
+                  {watch.action &&
+                    state.decisions.findLast((entry) => entry.action?.runId)
+                      ?.action?.runId && (
+                      <Link
+                        to={`/runs/${state.decisions.findLast((entry) => entry.action?.runId)!.action!.runId}`}
+                      >
+                        Open latest action
+                      </Link>
+                    )}
                   <ErrorNotice error={state.error} />
                   {latestRun ? (
                     <>
@@ -150,14 +160,6 @@ export function WatchDashboard() {
                   ) : (
                     <p className="muted">
                       Waiting for the first scheduled run.
-                    </p>
-                  )}
-                  {watch.enabled && (
-                    <p className="watch-meta">
-                      Next schedule check:{" "}
-                      {Date.parse(state.nextCheck) === 0
-                        ? "Waiting for baseline"
-                        : new Date(state.nextCheck).toLocaleString()}
                     </p>
                   )}
                 </article>

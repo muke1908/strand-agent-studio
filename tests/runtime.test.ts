@@ -14,6 +14,67 @@ import { digest, writeJson } from "../server/files.ts";
 import { createRunStore } from "../server/run-store.ts";
 import { executeRun } from "../server/run-engine.ts";
 import { checkpointPrefix } from "../server/run-checkpoint.ts";
+import { executeProcess } from "../server/process-runner.ts";
+
+test("stage restart recovers a stopped missing-receipt attempt without repeating completed work", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const definition = workflow();
+  catalog.saveWorkflow(definition);
+  const base = fixtureBackend();
+  let interrupted = true;
+  let directory = "";
+  const backend: AgentBackend = {
+    ...base,
+    async execute(request, signal) {
+      if (
+        interrupted &&
+        request.purpose === "stage" &&
+        request.prompt.includes('Execute stage "Report"')
+      ) {
+        interrupted = false;
+        directory = request.directory;
+        await executeProcess(
+          directory,
+          process.execPath,
+          ["-e", "console.log('interrupted attempt')"],
+          signal,
+        );
+        fs.unlinkSync(path.join(directory, "exit.json"));
+        throw new Error("Supervisor interrupted before receipt");
+      }
+      return base.execute(request, signal);
+    },
+  };
+  const host = createRunHost(root, catalog, backend);
+  try {
+    const source = host.launch(
+      definition.id,
+      { context: "Recover only the interrupted stage." },
+      "interrupted-source",
+    );
+    await waitForRun(() => host.store.get(source.id));
+    host.resume(source.id);
+    const before = await waitForRun(() => host.store.get(source.id));
+    assert.equal(before.status, "blocked");
+    assert.match(before.error!, /outcome is unknown/);
+    const child = host.rerun(source.id, "report", "recovered-stage");
+    const finished = await waitForRun(() => host.store.get(child.id));
+    assert.equal(finished.status, "completed", finished.error);
+    assert.equal(finished.units["discover/alpha"].reusedFrom, source.id);
+    assert.equal(finished.units["report/writer"].attempts.length, 1);
+    assert.deepEqual(host.store.get(source.id), before);
+    assert(!fs.existsSync(path.join(directory, "exit.json")));
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(directory, "recovery.json"), "utf8"))
+        .status,
+      "interrupted-stopped",
+    );
+  } finally {
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
 
 test("AI-expanded anyOf schemas pass unchanged to agents and downstream handoffs across recovery", async () => {
   const root = temporaryRoot();
@@ -341,6 +402,48 @@ test("linked Markdown is loaded for fresh runs and remains pinned for Resume and
     );
     assert.equal(host.store.list().length, count);
     fs.writeFileSync(file, "# Writer\nUpdated linked instructions.");
+    definition.queued = true;
+    catalog.saveWorkflow(definition, catalog.workflow(definition.id).revision);
+    prompts.length = 0;
+    const restarted = host.rerun(
+      source.id,
+      "report",
+      "linked-restart",
+      undefined,
+      true,
+    );
+    assert.equal(
+      (await waitForRun(() => host.store.get(restarted.id))).status,
+      "completed",
+    );
+    assert.equal(prompts.length, 1);
+    assert.equal(restarted.queued, true);
+    assert.match(prompts[0], /Updated linked instructions/);
+    assert.equal(
+      host.store.get(restarted.id).units["discover/alpha"].reusedFrom,
+      source.id,
+    );
+    assert.equal(
+      host.rerun(source.id, "report", "linked-restart", undefined, true).id,
+      restarted.id,
+    );
+    assert.throws(
+      () => host.rerun(source.id, "report", "linked-restart"),
+      /Submission identity/,
+    );
+    definition.stages[1].agents[0].model = "changed-model";
+    catalog.saveWorkflow(definition, catalog.workflow(definition.id).revision);
+    assert.throws(
+      () =>
+        host.rerun(
+          source.id,
+          "report",
+          "incompatible-restart",
+          undefined,
+          true,
+        ),
+      /structure or permissions changed/,
+    );
     prompts.length = 0;
     const fresh = host.launch(definition.id, input, "linked-fresh");
     assert.equal(
@@ -731,6 +834,103 @@ test("JSON validation supports conditional allOf approval gates", () => {
       evidence: [],
     }),
   );
+});
+
+test("long-running agents and summaries have no deadline while stop and shutdown still cancel", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  // Native AbortSignal timers do not use Node's mocked setTimeout clock.
+  context.mock.method(AbortSignal, "timeout", (milliseconds: number) => {
+    const abort = new AbortController();
+    setTimeout(
+      () => abort.abort(new Error("Agent deadline elapsed")),
+      milliseconds,
+    );
+    return abort.signal;
+  });
+  for (const action of ["complete", "stop", "shutdown"]) {
+    const root = temporaryRoot();
+    const catalog = createCatalog(root);
+    const definition = workflow();
+    definition.stages[0].agents = [definition.stages[0].agents[0]];
+    catalog.saveWorkflow(definition);
+    let markStageStarted!: () => void;
+    const stageStarted = new Promise<void>((resolve) => {
+      markStageStarted = resolve;
+    });
+    let releaseStage = () => {};
+    let markSummaryStarted!: () => void;
+    const summaryStarted = new Promise<void>((resolve) => {
+      markSummaryStarted = resolve;
+    });
+    let releaseSummary!: () => void;
+    const summaryGate = new Promise<void>((resolve) => {
+      releaseSummary = resolve;
+    });
+    const backend: AgentBackend = {
+      id: "long-running-fixture",
+      diagnostics: () => ({ available: true }),
+      async execute(request, signal) {
+        signal.throwIfAborted();
+        if (request.purpose === "schema") return request.input;
+        if (request.purpose === "summary") {
+          if (action === "complete") {
+            markSummaryStarted();
+            await summaryGate;
+            signal.throwIfAborted();
+          }
+          return {
+            lines: ["Fixture work finished.", "No external actions ran."],
+          };
+        }
+        if (request.prompt.includes('Execute stage "Discover"')) {
+          await new Promise<void>((resolve, reject) => {
+            const cancel = () => reject(signal.reason);
+            releaseStage = () => {
+              signal.removeEventListener("abort", cancel);
+              resolve();
+            };
+            signal.addEventListener("abort", cancel, { once: true });
+            markStageStarted();
+          });
+        }
+        signal.throwIfAborted();
+        return { summary: "Long-running fixture output" };
+      },
+    };
+    const host = createRunHost(root, catalog, backend);
+    try {
+      const run = host.launch(
+        definition.id,
+        { context: "Keep working past the old deadline" },
+        `no-deadline-${action}`,
+      );
+      await stageStarted;
+      context.mock.timers.tick(31 * 60 * 1000);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(host.store.get(run.id).status, "running", action);
+      if (action === "complete") {
+        releaseStage();
+        await summaryStarted;
+        assert.equal(host.store.get(run.id).status, "completed");
+        context.mock.timers.tick(3 * 60 * 1000);
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(host.summaries.read(run.id)?.status, "generating");
+        releaseSummary();
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(host.summaries.read(run.id)?.status, "completed");
+      } else {
+        if (action === "stop") host.stop(run.id);
+        else await host.close();
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(host.store.get(run.id).status, "cancelled", action);
+      }
+    } finally {
+      releaseStage();
+      releaseSummary();
+      await host.close();
+      fs.rmSync(root, { recursive: true });
+    }
+  }
 });
 
 test("stage barrier retains all outputs, validates bindings and selects the final result", async () => {

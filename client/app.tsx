@@ -8,6 +8,7 @@ import {
   Settings2,
   BookOpen,
   PanelsTopLeft,
+  ListOrdered,
 } from "lucide-react";
 import { Overview } from "./pages/overview.tsx";
 import { Workflows } from "./pages/workflows.tsx";
@@ -18,12 +19,14 @@ import { Skills } from "./pages/skills.tsx";
 import { Watches } from "./pages/watches.tsx";
 import { Settings } from "./pages/settings.tsx";
 import { WatchDashboard } from "./pages/watch-dashboard.tsx";
+import { Queue } from "./pages/queue.tsx";
 
 const links = [
   { to: "/", label: "Overview", icon: LayoutGrid },
   { to: "/pipelines", label: "Workflows", icon: GitBranch },
   { to: "/skills", label: "Skills", icon: BookOpen },
   { to: "/runs", label: "Runs", icon: Blocks },
+  { to: "/queue", label: "Queue", icon: ListOrdered },
   { to: "/watches", label: "Watches", icon: Radio },
   { to: "/dashboard", label: "Dashboard", icon: PanelsTopLeft },
   { to: "/settings", label: "Settings", icon: Settings2 },
@@ -61,6 +64,7 @@ export function App() {
           <Route path="/pipelines/:id/run" element={<Launch />} />
           <Route path="/runs" element={<Runs />} />
           <Route path="/runs/:id" element={<RunDetail />} />
+          <Route path="/queue" element={<Queue />} />
           <Route path="/skills" element={<Skills />} />
           <Route path="/watches" element={<Watches />} />
           <Route path="/dashboard" element={<WatchDashboard />} />

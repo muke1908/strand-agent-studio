@@ -400,6 +400,24 @@ p {
 .list-row:last-child {
   border: none;
 }
+.run-history {
+  display: grid;
+  gap: 24px;
+}
+.run-history .section-heading {
+  margin: 0 0 12px;
+  gap: 12px;
+}
+.run-history h2,
+.run-history .list-row > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.run-history .section-heading > span,
+.run-history .list-row > svg,
+.run-history .status {
+  flex-shrink: 0;
+}
 .activity-card {
   background: transparent;
   border: 0;
@@ -1311,6 +1329,16 @@ input[type="checkbox"] {
   color: #a496b0;
   font-size: 12px;
   margin-top: 17px;
+}
+.watch-timing p {
+  margin: 8px 0;
+}
+.watch-timing .watch-next-run {
+  color: #796886;
+  font-weight: 500;
+}
+.watch-schedule-details summary {
+  cursor: pointer;
 }
 .watch-history {
   border-top: 1px solid #f0eaf5;

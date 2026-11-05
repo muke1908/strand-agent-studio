@@ -270,6 +270,88 @@ test("busy workflows queue only the latest change and apply the hourly admission
   }
 });
 
+test("watch submissions inherit serial scheduling and skip a target that is pending or active", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const definition = { ...workflow(), queued: true };
+  catalog.saveWorkflow(definition);
+  catalog.saveWorkflow({ ...definition, id: "blocker" });
+  catalog.saveWatch(registration);
+  const base = fixtureBackend();
+  const release = Promise.withResolvers<void>();
+  const targetStarted = Promise.withResolvers<void>();
+  const releaseTarget = Promise.withResolvers<void>();
+  const host = createRunHost(root, catalog, {
+    ...base,
+    async execute(request, signal) {
+      if (request.purpose === "stage") {
+        await release.promise;
+        if (
+          request.input &&
+          typeof request.input === "object" &&
+          !Array.isArray(request.input) &&
+          request.input.context === "1"
+        ) {
+          targetStarted.resolve();
+          await releaseTarget.promise;
+        }
+      }
+      return base.execute(request, signal);
+    },
+  });
+  let event = 0;
+  const policy: WatchPolicy = {
+    id: "change",
+    name: "Change",
+    description: "",
+    settingsSchema: { type: "object" },
+    async evaluate() {
+      return {
+        cursor: ++event,
+        candidates: [
+          {
+            eventId: String(event),
+            resourceId: "resource",
+            payload: { context: String(event) },
+            reason: "Changed",
+          },
+        ],
+      };
+    },
+  };
+  try {
+    const watcher = createWatcher(root, catalog, host, [policy]);
+    const blocker = host.launch(
+      "blocker",
+      { context: "Manual run" },
+      "blocker",
+    );
+    const launched = await watcher.evaluate(registration);
+    const id = launched.decisions[0].runId!;
+    assert.equal(host.store.get(id).queued, true);
+    assert.equal(host.store.get(id).status, "queued");
+    await watcher.evaluate(registration);
+    assert.equal(host.store.list().length, 2);
+    host.stop(blocker.id);
+    release.resolve();
+    await waitForRun(() => host.store.get(blocker.id));
+    await targetStarted.promise;
+    assert.equal(host.store.get(id).status, "running");
+    await watcher.evaluate(registration);
+    assert.equal(host.store.list().length, 2);
+    releaseTarget.resolve();
+    assert.equal(
+      (await waitForRun(() => host.store.get(id))).status,
+      "completed",
+    );
+  } finally {
+    release.resolve();
+    releaseTarget.resolve();
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
 test("dispatch honors pause and limit edits made while provider evaluation is pending", async () => {
   for (const edit of ["pause", "limit"]) {
     const root = temporaryRoot();

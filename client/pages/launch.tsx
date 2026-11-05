@@ -121,7 +121,13 @@ export function Launch() {
             }
           >
             <Play size={15} />
-            {busy ? "Starting…" : "Run workflow"}
+            {resource.data.value.queued
+              ? busy
+                ? "Adding…"
+                : "Add to queue"
+              : busy
+                ? "Starting…"
+                : "Run workflow"}
           </button>
         </div>
       </form>

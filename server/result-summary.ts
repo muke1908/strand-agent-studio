@@ -129,10 +129,7 @@ export function createResultSummaries(store: RunStore, backend: AgentBackend) {
       return { status: "generating" };
     }
     const abort = new AbortController();
-    const signal = AbortSignal.any([
-      abort.signal,
-      AbortSignal.timeout(120_000),
-    ]);
+    const signal = abort.signal;
     writeJson(file(id), { status: "generating", evidenceDigest });
     const publish = (summary: ResultSummary) => {
       // A resumed run can finish again while an older summary is still being generated.

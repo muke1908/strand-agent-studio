@@ -1,9 +1,10 @@
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { Catalog } from "./catalog.ts";
 import type { AgentBackend } from "./agent-backend.ts";
 import { claim } from "./files.ts";
 import { digest } from "./files.ts";
-import { createRunStore } from "./run-store.ts";
+import { compareQueueOrder, createRunStore } from "./run-store.ts";
 import { executeRun } from "./run-engine.ts";
 import { validateJson } from "./validation.ts";
 import {
@@ -11,11 +12,23 @@ import {
   resolveWorkflowFolders,
 } from "./allowed-folders.ts";
 import { stageSkipSchema } from "../shared/contracts.ts";
-import type { Json, Run, StageSkip } from "../shared/contracts.ts";
+import type { Json, QueueState, Run, StageSkip } from "../shared/contracts.ts";
 import { checkpointPrefix } from "./run-checkpoint.ts";
 import { assertAttemptStopped } from "./process-runner.ts";
 import { createResultSummaries } from "./result-summary.ts";
 import { resolveWorkflowInstructions } from "./instruction-files.ts";
+import { createWatchActionCompiler } from "./watch-action-compiler.ts";
+
+export class WorkflowBusyError extends Error {
+  readonly status = 409;
+  readonly runId: string;
+  constructor(runId: string) {
+    super(
+      `Run ${runId} is using this workflow. Stop or finish it before starting another run.`,
+    );
+    this.runId = runId;
+  }
+}
 
 export function createRunHost(
   root: string,
@@ -24,13 +37,44 @@ export function createRunHost(
 ) {
   const store = createRunStore(root);
   const summaries = createResultSummaries(store, backend);
+  const actionCompiler = createWatchActionCompiler(root, catalog, backend);
   const active = new Map<
     string,
-    { abort: AbortController; promise: Promise<void> }
+    { abort: AbortController; promise: Promise<void>; queued: boolean }
   >();
-  const queue = new Set<string>();
+  const queue = new Map<string, Run>();
   const errors: string[] = [];
   type Snapshot = ReturnType<typeof store.snapshot>;
+  function busy(workflowId: string, excludeId?: string): Run | undefined {
+    return store
+      .list()
+      .find(
+        (run) =>
+          run.id !== excludeId &&
+          run.workflowId === workflowId &&
+          (["queued", "running"].includes(run.status) || active.has(run.id)),
+      );
+  }
+  function assertWorkflowIdle(
+    workflowId: string,
+    excludeId?: string,
+    required = false,
+  ): void {
+    if (
+      !required &&
+      !catalog
+        .watches()
+        .some(
+          ({ value }) =>
+            value.action &&
+            (value.workflowId === workflowId ||
+              value.action.workflowId === workflowId),
+        )
+    )
+      return;
+    const other = busy(workflowId, excludeId);
+    if (other) throw new WorkflowBusyError(other.id);
+  }
   function containsFolder(parent: string, child: string): boolean {
     const relative = path.relative(parent, child);
     return (
@@ -79,15 +123,15 @@ export function createRunHost(
   let closing = false;
   function pump(): void {
     if (closing || active.size >= 2) return;
-    const id = queue.values().next().value;
-    if (!id) return;
+    const serialActive = [...active.values()].some((item) => item.queued);
+    const next = [...queue.values()].find(
+      (run) => !run.queued || !serialActive,
+    );
+    if (!next) return;
+    const id = next.id;
     queue.delete(id);
     const abort = new AbortController();
-    const signal = AbortSignal.any([
-      abort.signal,
-      AbortSignal.timeout(30 * 60 * 1000),
-    ]);
-    const promise = executeRun(store, id, backend, signal)
+    const promise = executeRun(store, id, backend, abort.signal)
       .then(() => {
         if (closing) return;
         try {
@@ -105,10 +149,10 @@ export function createRunHost(
         active.delete(id);
         pump();
       });
-    active.set(id, { abort, promise });
+    active.set(id, { abort, promise, queued: next.queued ?? false });
     pump();
   }
-  for (const run of store.list()) {
+  for (const run of store.list().sort(compareQueueOrder)) {
     if (run.status === "running") {
       const release = store.lease(run.id);
       try {
@@ -119,19 +163,33 @@ export function createRunHost(
       } finally {
         release();
       }
-    } else if (run.status === "queued") queue.add(run.id);
+    } else if (run.status === "queued") queue.set(run.id, run);
   }
   queueMicrotask(pump);
   return {
     store,
     summaries,
     errors,
+    busy,
+    queueState(): QueueState {
+      const runs = store
+        .list()
+        .filter((run) => run.queued)
+        .sort((a, b) => compareQueueOrder(b, a));
+      return {
+        runs: runs.slice(0, 30),
+        pending: runs.filter((run) => run.status === "queued").length,
+        running: runs.filter((run) => run.status === "running").length,
+      };
+    },
+    compileWatchAction: actionCompiler.compile,
     launch(
       workflowId: string,
       input: Json,
       requestId: string,
       trigger?: Run["trigger"],
       allowAllTools = false,
+      idleWorkflowIds: string[] = [],
     ): Run {
       if (closing)
         throw Object.assign(new Error("Host is shutting down"), {
@@ -157,6 +215,9 @@ export function createRunHost(
             );
           return existing;
         }
+        assertWorkflowIdle(workflowId);
+        for (const id of idleWorkflowIds)
+          assertWorkflowIdle(id, undefined, true);
         const diagnostic = backend.diagnostics();
         if (!diagnostic.available)
           throw Object.assign(new Error(diagnostic.reason), { status: 503 });
@@ -175,7 +236,7 @@ export function createRunHost(
           trigger,
           allowAllTools,
         );
-        queue.add(run.id);
+        queue.set(run.id, run);
         queueMicrotask(pump);
         return run;
       } finally {
@@ -187,6 +248,7 @@ export function createRunHost(
       fromStageId: string,
       requestId: string,
       skip?: Omit<StageSkip, "stageId" | "at">,
+      latestInstructions = false,
     ): Run {
       if (closing)
         throw Object.assign(new Error("Host is shutting down"), {
@@ -208,6 +270,8 @@ export function createRunHost(
           if (
             existing.continuation?.sourceRunId !== id ||
             existing.continuation.fromStageId !== fromStageId ||
+            (store.snapshot(existing.id).continuation?.latestInstructions ??
+              false) !== latestInstructions ||
             existing.stageSkips?.find((item) => item.stageId === fromStageId)
               ?.reason !== override?.reason ||
             existing.stageSkips?.find((item) => item.stageId === fromStageId)
@@ -220,6 +284,7 @@ export function createRunHost(
           return existing;
         }
         const source = store.get(id);
+        assertWorkflowIdle(source.workflowId);
         if (
           override &&
           (!["blocked", "cancelled"].includes(source.status) ||
@@ -243,6 +308,32 @@ export function createRunHost(
         try {
           store.verify(id);
           const snapshot = store.snapshot(id);
+          let workflow = snapshot.workflow;
+          if (latestInstructions) {
+            const current = resolveWorkflowFolders(
+              catalog.workflow(source.workflowId).value,
+            );
+            const structure = (value: typeof workflow) => ({
+              ...value,
+              queued: false,
+              stages: value.stages.map((stage) => ({
+                ...stage,
+                instructions: "",
+                agents: stage.agents.map((agent) => ({
+                  ...agent,
+                  instructions: "",
+                })),
+              })),
+            });
+            if (!isDeepStrictEqual(structure(current), structure(workflow)))
+              throw Object.assign(
+                new Error(
+                  "Workflow structure or permissions changed. Restart with pinned instructions or launch a new run.",
+                ),
+                { status: 409 },
+              );
+            workflow = resolveWorkflowInstructions(current);
+          }
           if (snapshot.backendId !== backend.id)
             throw Object.assign(
               new Error("Pinned backend is unavailable; refusing substitution"),
@@ -271,11 +362,12 @@ export function createRunHost(
               try {
                 assertAttemptStopped(
                   path.join(store.directory(id), "attempts", attempt.id),
+                  true,
                 );
               } catch (error) {
                 throw Object.assign(
                   new Error(
-                    "A previous attempt is still active or has an unresolved process outcome; resolve it before rerunning",
+                    `Cannot restart while a previous attempt is active or unverifiable: ${error instanceof Error ? error.message : String(error)}`,
                     { cause: error },
                   ),
                   { status: 409 },
@@ -298,6 +390,7 @@ export function createRunHost(
           const continuation: NonNullable<Snapshot["continuation"]> = {
             sourceRunId: id,
             fromStageId,
+            ...(latestInstructions ? { latestInstructions: true } : {}),
             checkpoints,
             history: Object.fromEntries(
               Object.entries(
@@ -332,7 +425,7 @@ export function createRunHost(
           };
           assertNoContinuationConflict({ ...snapshot, continuation });
           const run = store.create(
-            snapshot.workflow,
+            workflow,
             snapshot.skills,
             snapshot.input,
             requestId,
@@ -347,7 +440,7 @@ export function createRunHost(
                 : {}),
             },
           );
-          queue.add(run.id);
+          queue.set(run.id, run);
           queueMicrotask(pump);
           return run;
         } finally {
@@ -378,13 +471,13 @@ export function createRunHost(
       const admission = claim(path.join(root, "admission"));
       try {
         store.verify(id);
+        assertWorkflowIdle(run.workflowId, id);
         assertNoContinuationConflict(store.snapshot(id), id);
         const release = store.lease(id);
         try {
-          run.status = "queued";
           delete run.error;
-          store.save(run);
-          queue.add(id);
+          store.enqueue(run);
+          queue.set(id, run);
         } finally {
           release();
         }
@@ -407,6 +500,7 @@ export function createRunHost(
     },
     async close(): Promise<void> {
       closing = true;
+      await actionCompiler.close();
       for (const item of active.values())
         item.abort.abort(new Error("Host shutting down"));
       await Promise.all([...active.values()].map((item) => item.promise));

@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { zipSync } from "fflate";
 import { z } from "zod";
+import type { Json } from "../shared/contracts.ts";
 import { acceptedOutputSchema, outputArtifactName } from "./run-checkpoint.ts";
 import type { RunStore } from "./run-store.ts";
 
@@ -13,6 +14,24 @@ const reportSchema = z.object({
 
 function fail(message: string, status = 409): never {
   throw Object.assign(new Error(message), { status });
+}
+
+function containingFolder(file: string, folders: string[]): number {
+  return folders.findIndex((folder) => {
+    const relative = path.relative(folder, file);
+    return (
+      relative !== "" &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative)
+    );
+  });
+}
+
+function* fileReferences(value: Json): Generator<string> {
+  if (typeof value === "string" && path.isAbsolute(value)) yield value;
+  else if (value !== null && typeof value === "object")
+    for (const child of Object.values(value)) yield* fileReferences(child);
 }
 
 export function runAssets(store: RunStore, id: string): Uint8Array {
@@ -93,46 +112,62 @@ export function runAssets(store: RunStore, id: string): Uint8Array {
           ),
         ),
       );
-      if (!output || typeof output !== "object" || Array.isArray(output))
-        continue;
-      const report = output.report;
-      if (
-        !report ||
-        typeof report !== "object" ||
-        Array.isArray(report) ||
-        !Object.hasOwn(report, "path")
-      )
-        continue;
-      const parsed = reportSchema.safeParse(report);
-      if (!parsed.success)
-        fail(`Invalid report metadata for ${stage.name} / ${agent.name}.`);
-      const metadata = parsed.data;
-      if (!path.isAbsolute(metadata.path))
-        fail("Published reports must have an absolute path.");
-      const resolved = fs.realpathSync(metadata.path);
       const folders = agent.allowedFolders ?? snapshot.allowedFolders ?? [];
+      const included = new Set<string>();
+      const report =
+        output && typeof output === "object" && !Array.isArray(output)
+          ? output.report
+          : undefined;
       if (
-        !folders.some((folder) => {
-          const relative = path.relative(folder, resolved);
-          return (
-            relative !== "" &&
-            relative !== ".." &&
-            !relative.startsWith(`..${path.sep}`) &&
-            !path.isAbsolute(relative)
+        report &&
+        typeof report === "object" &&
+        !Array.isArray(report) &&
+        Object.hasOwn(report, "path")
+      ) {
+        const parsed = reportSchema.safeParse(report);
+        if (!parsed.success)
+          fail(`Invalid report metadata for ${stage.name} / ${agent.name}.`);
+        const metadata = parsed.data;
+        if (!path.isAbsolute(metadata.path))
+          fail("Published reports must have an absolute path.");
+        const resolved = fs.realpathSync(metadata.path);
+        if (containingFolder(resolved, folders) < 0)
+          fail(
+            "Published report is outside this agent's pinned allowed folders.",
           );
-        })
-      )
-        fail(
-          "Published report is outside this agent's pinned allowed folders.",
+        const basename = path
+          .basename(metadata.path)
+          .replace(/[^a-zA-Z0-9._-]/g, "_");
+        add(
+          metadata.path,
+          `reports/${stage.id}-${agent.id}/${basename}`,
+          metadata.sha256,
         );
-      const basename = path
-        .basename(metadata.path)
-        .replace(/[^a-zA-Z0-9._-]/g, "_");
-      add(
-        metadata.path,
-        `reports/${stage.id}-${agent.id}/${basename}`,
-        metadata.sha256,
-      );
+        included.add(resolved);
+      }
+
+      if (stage.id !== snapshot.workflow.stages.at(-1)?.id) continue;
+      for (const file of new Set(fileReferences(output))) {
+        // Final outputs also cite source paths; only export within pinned grants.
+        if (containingFolder(file, folders) < 0) continue;
+        const stat = fs.lstatSync(file);
+        if (stat.isDirectory()) continue;
+        if (stat.isSymbolicLink())
+          fail(`Asset downloads do not follow symbolic links: ${file}`);
+        const resolved = fs.realpathSync(file);
+        const folderIndex = containingFolder(resolved, folders);
+        if (folderIndex < 0)
+          fail("Output asset is outside this agent's pinned allowed folders.");
+        if (included.has(resolved)) continue;
+        const relative = path.relative(folders[folderIndex], resolved);
+        if (relative.includes("\\"))
+          fail(`Unsupported asset filename: ${relative}`);
+        add(
+          file,
+          `outputs/${stage.id}-${agent.id}/${folderIndex + 1}/${relative.split(path.sep).join("/")}`,
+        );
+        included.add(resolved);
+      }
     }
   }
   return zipSync(files);

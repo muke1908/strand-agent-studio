@@ -1,13 +1,17 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { Plus, Radio, X, Pause, Play } from "lucide-react";
-import { watchSchema } from "../../shared/contracts.ts";
+import {
+  watchRegistrationSchema,
+  watchSchema,
+} from "../../shared/contracts.ts";
 import type {
   Json,
   Saved,
   Schema,
   Watch,
   WatchState,
+  WatchActionRequest,
   Workflow,
 } from "../../shared/contracts.ts";
 import { api, errorMessage, useResource } from "../api.ts";
@@ -19,6 +23,7 @@ import {
   StatusBadge,
 } from "../components.tsx";
 import { SchemaForm } from "../forms/schema-form.tsx";
+import { WatchDecisionReason, WatchTiming } from "../watch-timing.tsx";
 
 type Policy = {
   id: string;
@@ -35,11 +40,13 @@ export function Watches() {
   const [revision, setRevision] = useState<string>();
   const [error, setError] = useState("");
   const [jsonError, setJsonError] = useState("");
+  const [actionDraft, setActionDraft] = useState<WatchActionRequest>();
   const [busy, setBusy] = useState(false);
   function create() {
     setRevision(undefined);
     setError("");
     setJsonError("");
+    setActionDraft(undefined);
     setDraft({
       id: `watch-${crypto.randomUUID().slice(0, 8)}`,
       name: "Scheduled workflow",
@@ -58,13 +65,20 @@ export function Watches() {
       maxRunsPerHour: 10,
     });
   }
-  async function persist(value: Watch, priorRevision?: string) {
+  async function persist(
+    value: Watch,
+    priorRevision?: string,
+    action?: WatchActionRequest,
+  ) {
     setBusy(true);
     try {
       await api(`/pipeline-watches/${value.id}`, {
         method: "PUT",
         body: JSON.stringify({
-          value: watchSchema.parse(value),
+          value: watchRegistrationSchema.parse({
+            ...value,
+            ...(action ? { action } : {}),
+          }),
           revision: priorRevision,
         }),
       });
@@ -108,11 +122,24 @@ export function Watches() {
       ) : (
         <div className="watch-grid">
           {resource.data.map((item) => (
-            <section key={item.value.id} className="watch-card">
+            <section
+              key={item.value.id}
+              className="watch-card"
+              aria-label={item.value.name}
+            >
               <div className="watch-title">
                 <Radio size={18} />
                 <button
                   onClick={() => {
+                    setJsonError("");
+                    setActionDraft(
+                      item.value.action
+                        ? {
+                            workflowId: item.value.action.workflowId,
+                            whenToRun: item.value.action.whenToRun ?? "",
+                          }
+                        : undefined,
+                    );
                     setDraft(item.value);
                     setRevision(item.revision);
                   }}
@@ -144,27 +171,46 @@ export function Watches() {
                   )?.name
                 }{" "}
                 · {item.value.workflowId}
+                {item.value.action && ` → ${item.value.action.workflowId}`}
               </p>
               <StatusBadge
-                status={item.value.enabled ? "watching" : "paused"}
+                status={
+                  item.value.enabled
+                    ? (item.state.phase ?? "watching")
+                    : "paused"
+                }
               />
               <ErrorNotice error={item.state.error} />
-              <div className="watch-meta">
-                Next check:{" "}
-                {new Date(item.state.nextCheck).getFullYear() === 1970
-                  ? "Establishing baseline"
-                  : new Date(item.state.nextCheck).toLocaleString()}
-              </div>
+              <WatchTiming watch={item.value} state={item.state} />
               <div className="watch-history">
                 {item.state.decisions.length ? (
                   item.state.decisions
-                    .slice(-4)
+                    .slice(-2)
                     .reverse()
                     .map((decision) => (
                       <div key={`${decision.resourceId}-${decision.eventId}`}>
-                        <span>{decision.reason}</span>
+                        <span>
+                          <WatchDecisionReason
+                            watch={item.value}
+                            decision={decision}
+                          />
+                        </span>
                         {decision.runId ? (
-                          <Link to={`/runs/${decision.runId}`}>Open run →</Link>
+                          <>
+                            <Link to={`/runs/${decision.runId}`}>
+                              {item.value.action ? "Open check" : "Open run →"}
+                            </Link>
+                            {decision.action?.runId && (
+                              <Link to={`/runs/${decision.action.runId}`}>
+                                Open action
+                              </Link>
+                            )}
+                            {decision.outcome && (
+                              <small>
+                                {decision.outcomeReason ?? decision.outcome}
+                              </small>
+                            )}
+                          </>
                         ) : (
                           <small>{decision.status}</small>
                         )}
@@ -186,7 +232,12 @@ export function Watches() {
             className="modal-panel"
             onSubmit={(event) => {
               event.preventDefault();
-              if (!jsonError) void persist(draft, revision);
+              if (!jsonError)
+                void persist(
+                  draft,
+                  revision,
+                  revision ? undefined : actionDraft,
+                );
             }}
           >
             <div className="inspector-heading">
@@ -229,7 +280,7 @@ export function Watches() {
               Policy
               <select
                 value={draft.policyId}
-                onChange={(event) =>
+                onChange={(event) => {
                   setDraft({
                     ...draft,
                     policyId: event.target.value,
@@ -237,8 +288,8 @@ export function Watches() {
                       event.target.value === "schedule-cron"
                         ? { expression: "0 9 * * 1-5", timeZone: "UTC" }
                         : { prUrl: "" },
-                  })
-                }
+                  });
+                }}
               >
                 {policies.data?.map((item) => (
                   <option key={item.id} value={item.id}>
@@ -264,6 +315,85 @@ export function Watches() {
               }
               onError={setJsonError}
             />
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={Boolean(actionDraft)}
+                disabled={Boolean(revision)}
+                onChange={(event) => {
+                  setActionDraft(
+                    event.target.checked
+                      ? {
+                          workflowId:
+                            workflows.data?.find(
+                              ({ value }) => value.id !== draft.workflowId,
+                            )?.value.id ?? draft.workflowId,
+                          whenToRun: "",
+                        }
+                      : undefined,
+                  );
+                }}
+              />
+              Run an action workflow when the check qualifies
+            </label>
+            {actionDraft && (
+              <>
+                <label className="field">
+                  Action workflow
+                  <select
+                    required
+                    disabled={Boolean(revision)}
+                    value={actionDraft.workflowId}
+                    onChange={(event) =>
+                      setActionDraft({
+                        ...actionDraft,
+                        workflowId: event.target.value,
+                      })
+                    }
+                  >
+                    {workflows.data?.map(({ value }) => (
+                      <option key={value.id} value={value.id}>
+                        {value.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="field">
+                  <label htmlFor="watch-action-when">When to run</label>
+                  <textarea
+                    id="watch-action-when"
+                    required={!revision}
+                    readOnly={Boolean(revision)}
+                    maxLength={2000}
+                    rows={3}
+                    placeholder="For example: Run when there are open comments and the last comment is more than 30 minutes old."
+                    value={
+                      actionDraft.whenToRun ||
+                      (revision && draft.action
+                        ? draft.action.conditions
+                            .map(
+                              (condition) =>
+                                `${condition.pointer || "Result"} ${condition.operator} ${JSON.stringify(condition.value)}`,
+                            )
+                            .join(" and ")
+                        : "")
+                    }
+                    onChange={(event) =>
+                      setActionDraft({
+                        ...actionDraft,
+                        whenToRun: event.target.value,
+                      })
+                    }
+                  />
+                </div>
+                <p className="muted">
+                  {revision
+                    ? "This watch uses its saved rules. Create a new watch to change the action or condition."
+                    : "AI converts this sentence into fixed rules once when you save. Matching check inputs carry over to the action. Unsupported conditions will not be saved."}{" "}
+                  Checks wait while either workflow is busy.
+                </p>
+              </>
+            )}
             <div className="two-fields">
               <label className="field">
                 Cooldown (seconds)
@@ -314,12 +444,16 @@ export function Watches() {
               trusted workflow instructions.
             </p>
             <div className="form-footer">
-              <span>Queue latest. No automatic failure loop.</span>
+              <span>
+                {actionDraft
+                  ? "Suspend while busy. Fresh checks retry unsuccessful actions. Limits apply separately to each step."
+                  : "Queue latest. No automatic failure loop."}
+              </span>
               <button
                 className="button primary"
                 disabled={busy || Boolean(jsonError)}
               >
-                Save watch
+                {busy ? "Saving watch…" : "Save watch"}
               </button>
             </div>
           </form>

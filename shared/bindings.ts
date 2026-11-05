@@ -107,7 +107,7 @@ export function validateReferences(workflow: Workflow): void {
   if (workflow.result) validate(workflow.result, available);
 }
 
-function validatePointer(path: string): void {
+export function validatePointer(path: string): void {
   if (path !== "" && (!path.startsWith("/") || /~(?![01])/u.test(path)))
     throw new Error(`Invalid JSON Pointer: ${path}`);
 }
