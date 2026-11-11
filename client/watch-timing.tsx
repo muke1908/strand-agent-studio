@@ -1,8 +1,8 @@
-import { CronExpressionParser } from "cron-parser";
 import { Link } from "react-router-dom";
 import type { Decision, Watch, WatchState } from "../shared/contracts.ts";
 import { errorMessage } from "./api.ts";
 import { ErrorNotice } from "./components.tsx";
+import { readWatchSchedule } from "../shared/watch-schedule.ts";
 
 function readableTime(value: string) {
   return new Date(value).toLocaleString(undefined, {
@@ -15,38 +15,6 @@ function readableTime(value: string) {
   });
 }
 
-function scheduleDescription(expression: string) {
-  const fields = expression.trim().split(/\s+/);
-  if (fields.length === 5 && fields.slice(1).every((field) => field === "*")) {
-    const minute = fields[0];
-    if (minute === "*") return "Every minute";
-    if (minute === "0") return "Every hour, on the hour";
-    if (/^\d+$/.test(minute)) return `Every hour, at minute ${minute}`;
-    const step = minute.match(/^\*\/(\d+)$/);
-    if (step && Number(step[1]) > 0 && 60 % Number(step[1]) === 0)
-      return `Every ${Number(step[1])} minutes`;
-  }
-  return "Cron schedule";
-}
-
-function readSchedule(watch: Watch) {
-  const { expression, timeZone = "UTC" } = watch.settings;
-  if (typeof expression !== "string" || typeof timeZone !== "string")
-    throw new Error("Cron expression and time zone must be strings.");
-  const cron = CronExpressionParser.parse(expression, {
-    tz: timeZone,
-    currentDate: new Date(),
-  });
-  const next = cron.next().toISOString();
-  if (next === null) throw new Error("No upcoming cron occurrence available.");
-  return {
-    expression,
-    timeZone,
-    description: scheduleDescription(expression),
-    next,
-  };
-}
-
 export function WatchTiming({
   watch,
   state,
@@ -54,11 +22,11 @@ export function WatchTiming({
   watch: Watch;
   state: WatchState;
 }) {
-  let schedule: ReturnType<typeof readSchedule> | undefined;
+  let schedule: ReturnType<typeof readWatchSchedule> | undefined;
   let scheduleError = "";
   if (watch.policyId === "schedule-cron") {
     try {
-      schedule = readSchedule(watch);
+      schedule = readWatchSchedule(watch.settings);
     } catch (failure) {
       scheduleError = `Invalid schedule: ${errorMessage(failure)}`;
     }
@@ -95,9 +63,6 @@ export function WatchTiming({
       {schedule && (
         <details className="watch-schedule-details">
           <summary>Scheduler details</summary>
-          <p>
-            Cron: <code>{schedule.expression}</code> ({schedule.timeZone})
-          </p>
           {!watch.enabled ? (
             <p>Paused. No automatic runs.</p>
           ) : (

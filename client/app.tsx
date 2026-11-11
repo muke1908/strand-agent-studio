@@ -9,6 +9,7 @@ import {
   BookOpen,
   PanelsTopLeft,
   ListOrdered,
+  Zap,
 } from "lucide-react";
 import { Overview } from "./pages/overview.tsx";
 import { Workflows } from "./pages/workflows.tsx";
@@ -24,8 +25,10 @@ import { Queue } from "./pages/queue.tsx";
 const links = [
   { to: "/", label: "Overview", icon: LayoutGrid },
   { to: "/pipelines", label: "Workflows", icon: GitBranch },
+  { to: "/actions", label: "Actions", icon: Zap },
   { to: "/skills", label: "Skills", icon: BookOpen },
-  { to: "/runs", label: "Runs", icon: Blocks },
+  { to: "/runs", label: "Workflow runs", icon: Blocks },
+  { to: "/action-runs", label: "Action runs", icon: Zap },
   { to: "/queue", label: "Queue", icon: ListOrdered },
   { to: "/watches", label: "Watches", icon: Radio },
   { to: "/dashboard", label: "Dashboard", icon: PanelsTopLeft },
@@ -44,7 +47,7 @@ export function App() {
         <div className="workspace-label">YOUR WORKSPACE</div>
         <nav aria-label="Main navigation">
           {links.map(({ to, label, icon: Icon }) => (
-            <NavLink key={to} to={to} end={to === "/"}>
+            <NavLink key={to} to={to} end={to === "/" || to === "/runs"}>
               <Icon size={17} />
               {label}
             </NavLink>
@@ -58,11 +61,31 @@ export function App() {
       <main>
         <Routes>
           <Route path="/" element={<Overview />} />
-          <Route path="/pipelines" element={<Workflows />} />
-          <Route path="/pipelines/new" element={<WorkflowBuilder />} />
-          <Route path="/pipelines/:id" element={<WorkflowBuilder />} />
+          <Route path="/pipelines" element={<Workflows key="workflows" />} />
+          <Route
+            path="/pipelines/new"
+            element={<WorkflowBuilder key="workflow-new" />}
+          />
+          <Route
+            path="/pipelines/:id"
+            element={<WorkflowBuilder key="workflow" />}
+          />
           <Route path="/pipelines/:id/run" element={<Launch />} />
-          <Route path="/runs" element={<Runs />} />
+          <Route
+            path="/actions"
+            element={<Workflows key="actions" actions />}
+          />
+          <Route
+            path="/actions/new"
+            element={<WorkflowBuilder key="action-new" action />}
+          />
+          <Route
+            path="/actions/:id"
+            element={<WorkflowBuilder key="action" action />}
+          />
+          <Route path="/actions/:id/run" element={<Launch />} />
+          <Route path="/runs" element={<Runs key="workflows" />} />
+          <Route path="/action-runs" element={<Runs key="actions" actions />} />
           <Route path="/runs/:id" element={<RunDetail />} />
           <Route path="/queue" element={<Queue />} />
           <Route path="/skills" element={<Skills />} />

@@ -162,6 +162,94 @@ function setup() {
   };
 }
 
+test("deletion coordinates with evaluation and stale ticks cannot resurrect watches", async () => {
+  const s = setup();
+  const policy = s.gate("policyGate");
+  const probe = s.gate("probeGate");
+  const later = s.catalog.saveWatch({
+    ...s.watch,
+    id: "z-later",
+    name: "Deleted during tick",
+  });
+  const original = s.catalog.watch(s.watch.id);
+  const tick = s.watcher.tick();
+  try {
+    assert.equal(s.control.policyCalls, 1);
+    assert.throws(() => s.catalog.deleteWatch(s.watch.id, original.revision), {
+      status: 409,
+    });
+    assert.deepEqual(s.catalog.watch(s.watch.id), original);
+    s.catalog.deleteWatch(later.value.id, later.revision);
+    policy.resolve();
+    await tick;
+    assert.equal(s.control.policyCalls, 1);
+    assert.equal(
+      fs.existsSync(path.join(s.root, "watch-state", "z-later.json")),
+      false,
+    );
+    const runId = s.watcher.state(s.watch.id).activeRunId!;
+    const snapshot = s.host.store.snapshot(runId);
+    s.catalog.deleteWatch(s.watch.id, original.revision);
+    probe.resolve();
+    assert.equal(
+      (await waitForRun(() => s.host.store.get(runId))).status,
+      "completed",
+    );
+    assert.deepEqual(s.host.store.snapshot(runId), snapshot);
+    assert.equal(s.host.store.get(runId).trigger?.watchId, s.watch.id);
+    await assert.rejects(s.watcher.evaluate(s.watch), { status: 404 });
+    await assert.rejects(s.watcher.evaluate(later.value), { status: 404 });
+    const restarted = createWatcher(s.root, createCatalog(s.root), s.host, [
+      s.policy,
+    ]);
+    await restarted.tick(new Date(Date.now() + 3600000));
+    assert.equal(s.control.policyCalls, 1);
+    assert.equal(s.host.store.list().length, 1);
+    assert.equal(
+      fs.existsSync(path.join(s.root, "watch-state", "cycle.json")),
+      false,
+    );
+    assert.equal(
+      fs.existsSync(path.join(s.root, "watch-state", "z-later.json")),
+      false,
+    );
+  } finally {
+    policy.resolve();
+    await tick;
+    await s.close();
+  }
+});
+
+test("deleting a watch leaves its active action and completed check intact", async () => {
+  const s = setup();
+  const pending = s.gate("actionGate");
+  try {
+    const check = await s.check();
+    const state = await s.watcher.evaluate(s.watch);
+    assert.equal(state.phase, "acting");
+    const id = state.activeRunId!;
+    const snapshot = s.host.store.snapshot(id);
+    s.catalog.deleteWatch(s.watch.id, s.catalog.watch(s.watch.id).revision);
+    pending.resolve();
+    assert.equal(
+      (await waitForRun(() => s.host.store.get(id))).status,
+      "completed",
+    );
+    s.host.store.verify(id);
+    assert.deepEqual(s.host.store.snapshot(id), snapshot);
+    assert.equal(s.host.store.get(check.id).status, "completed");
+    assert.equal(s.host.store.get(id).trigger?.watchId, s.watch.id);
+    await s.watcher.tick(new Date(Date.now() + 3600000));
+    assert.equal(s.host.store.list().length, 2);
+    assert.equal(
+      fs.existsSync(path.join(s.root, "watch-state", "cycle.json")),
+      false,
+    );
+  } finally {
+    await s.close();
+  }
+});
+
 test("check/action cycles suspend, recover, bind inputs, consume successful revisions and retain new work during actions", async () => {
   const s = setup();
   const pending = s.gate("actionGate");

@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "required": ["context"],
+  "additionalProperties": false,
+  "properties": {
+    "context": { "type": "string", "minLength": 1 },
+    "scopeHints": { "type": "string", "title": "Scope hints" },
+    "telemetryStartUtc": {
+      "type": "string",
+      "title": "Telemetry start (UTC)",
+      "anyOf": [{ "const": "" }, { "format": "date-time", "pattern": "Z$" }]
+    },
+    "telemetryEndUtc": {
+      "type": "string",
+      "title": "Telemetry end (UTC)",
+      "anyOf": [
+        { "const": "" },
+        {
+          "format": "date-time",
+          "pattern": "Z$",
+          "formatExclusiveMinimum": { "$data": "1/telemetryStartUtc" }
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "telemetryStartUtc": {
+      "if": { "properties": { "telemetryStartUtc": { "minLength": 1 } } },
+      "then": {
+        "required": ["telemetryEndUtc"],
+        "properties": { "telemetryEndUtc": { "minLength": 1 } }
+      }
+    },
+    "telemetryEndUtc": {
+      "if": { "properties": { "telemetryEndUtc": { "minLength": 1 } } },
+      "then": {
+        "required": ["telemetryStartUtc"],
+        "properties": { "telemetryStartUtc": { "minLength": 1 } }
+      }
+    }
+  }
+}

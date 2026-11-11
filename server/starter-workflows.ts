@@ -83,14 +83,15 @@ export function seedCatalog(catalog: Catalog): void {
         stages: stageNames.map((stageName, index) => ({
           id: stageName.toLowerCase(),
           name: stageName,
-          instructions: `${stageName} the supplied material for ${name}. Use complete prior handoffs. No external retrieval or publication is authorized.`,
           skills: ["evidence-first"],
-          inputs: { context: { source: "input", pointer: "/context" } },
+          expectedOutput:
+            "Return a concise summary, supporting evidence, and useful next steps.",
           outputSchema: reportSchema,
           agents: [
             {
               id: "analyst",
               name: index === 0 ? "Analyst" : "Reviewer",
+              instructions: `${stageName} the supplied material for ${name}. Use complete prior handoffs. No external retrieval or publication is authorized.`,
               skills: [
                 index === stageNames.length - 1
                   ? "clear-writing"

@@ -67,7 +67,8 @@ export const loopSchema = z
       })
       .strict(),
     maxIterations: z.number().int().min(1).max(20),
-    feedback: z.record(z.string(), reference),
+    repeatWhen: z.string().max(2000).optional(),
+    feedback: z.record(z.string(), reference).default({}),
   })
   .strict();
 export const loopContextSchema = z.object({
@@ -107,10 +108,12 @@ export const stageSchema = z
   .object({
     id: identifier,
     name: z.string().min(1).max(120),
-    instructions: z.string().max(50000).default(""),
+    // Read legacy saved workflows without applying their stage instructions.
+    instructions: z.string().max(50000).optional(),
     skills: z.array(identifier).default([]),
     inputs: z.record(z.string(), reference).default({}),
-    outputSchema: schema,
+    expectedOutput: z.string().max(50000).optional(),
+    outputSchema: schema.default({ type: "object" }),
     agents: z.array(agentSchema).min(1).max(12),
     loop: loopSchema.optional(),
   })
@@ -121,6 +124,7 @@ export const workflowSchema = z
     name: z.string().min(1).max(120),
     description: z.string().max(2000).default(""),
     queued: z.boolean().optional(),
+    expectedInput: z.string().max(50000).optional(),
     inputSchema: schema,
     stages: z.array(stageSchema).min(1).max(24),
     result: reference.optional(),
@@ -162,6 +166,7 @@ export const watchActionSchema = z
       )
       .min(1)
       .max(20),
+    input: reference.optional(),
     inputBindings: z.record(z.string(), reference),
     deduplicationPointer: z.string().optional(),
     recheckSeconds: z.number().int().min(1).max(86400).default(600),
@@ -175,7 +180,8 @@ export const watchSchema = z
     enabled: z.boolean(),
     policyId: identifier,
     settings: z.record(z.string(), jsonValue),
-    inputBindings: z.record(z.string(), reference),
+    input: jsonValue.optional(),
+    inputBindings: z.record(z.string(), reference).default({}),
     allowAllTools: z.boolean().optional(),
     cooldownSeconds: z.number().int().min(0).max(86400).default(60),
     maxRunsPerHour: z.number().int().min(1).max(60).default(10),
@@ -242,6 +248,7 @@ export type UnitDetails = {
 };
 export type Run = {
   id: string;
+  historyDeleted?: boolean;
   workflowId: string;
   workflowName: string;
   status: Status;
@@ -277,7 +284,8 @@ export type ResultSummary =
   | { status: "generating" }
   | { status: "completed"; lines: string[] }
   | { status: "failed"; error: string };
-export type RunDetails = Run & {
+export type RunSummary = Run & { kind: "action" | "workflow" };
+export type RunDetails = RunSummary & {
   resultSummary?: ResultSummary;
   stages: {
     id: string;

@@ -28,16 +28,26 @@ function containingFolder(file: string, folders: string[]): number {
   });
 }
 
-function* fileReferences(value: Json): Generator<string> {
+function* fileReferences(value: Json, published = false): Generator<string> {
   if (typeof value === "string" && path.isAbsolute(value)) yield value;
+  else if (Array.isArray(value))
+    for (const child of value) yield* fileReferences(child, published);
   else if (value !== null && typeof value === "object")
-    for (const child of Object.values(value)) yield* fileReferences(child);
+    for (const [key, child] of Object.entries(value))
+      if (
+        published ||
+        key === "report" ||
+        key === "reportPaths" ||
+        key === "files" ||
+        /artifacts?$/i.test(key)
+      )
+        yield* fileReferences(child, true);
 }
 
 export function runAssets(store: RunStore, id: string): Uint8Array {
   const run = store.get(id);
-  if (run.status !== "completed")
-    fail("Assets can only be downloaded from a completed run.");
+  if (run.status !== "completed" && run.status !== "blocked")
+    fail("Assets can only be downloaded from a completed or blocked run.");
   store.verify(id);
   const snapshot = store.snapshot(id);
   const files: Record<string, Uint8Array> = {};
@@ -72,46 +82,34 @@ export function runAssets(store: RunStore, id: string): Uint8Array {
     }
   }
 
-  function walk(directory: string, prefix: string, depth = 0) {
-    if (depth > 32) fail("Asset directory nesting is too deep.", 413);
-    if (++entries > 10000)
-      fail("This run has too many asset files to download as a ZIP.", 413);
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      if (entry.name.includes("\\"))
-        fail(`Unsupported asset filename: ${entry.name}`);
-      const file = path.join(directory, entry.name);
-      const name = `${prefix}/${entry.name}`;
-      if (entry.isSymbolicLink())
-        fail(`Asset downloads do not follow symbolic links: ${file}`);
-      if (entry.isDirectory()) walk(file, name, depth + 1);
-      else if (entry.isFile()) add(file, name);
-      else fail(`Asset is not a regular file or directory: ${file}`);
-    }
-  }
+  if (run.status === "completed")
+    add(path.join(store.directory(id), "result.json"), "result.json");
+  else
+    files["run-status.json"] = Buffer.from(
+      JSON.stringify(
+        { id: run.id, status: run.status, error: run.error },
+        null,
+        2,
+      ),
+    );
+  let acceptedOutputs = 0;
 
-  const directory = store.directory(id);
-  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-    const file = path.join(directory, entry.name);
-    if (/^[a-zA-Z0-9_-]+\.json$/.test(entry.name))
-      add(file, `execution/${entry.name}`);
-    else if (entry.name === "attempts") {
-      if (!entry.isDirectory()) fail("Run attempts must be a directory.");
-      walk(file, "execution/attempts");
-    }
-  }
-
-  for (const stage of snapshot.workflow.stages) {
+  for (const stage of snapshot.workflow.stages.slice(-1)) {
     for (const agent of stage.agents) {
-      const { output } = acceptedOutputSchema.parse(
-        store.readArtifact(
-          id,
-          outputArtifactName(
-            stage.id,
-            agent.id,
-            run.units[`${stage.id}/${agent.id}`]?.visitId,
-          ),
-        ),
+      const artifact = outputArtifactName(
+        stage.id,
+        agent.id,
+        run.units[`${stage.id}/${agent.id}`]?.visitId,
       );
+      const raw = store.readArtifactIfPresent(id, artifact);
+      if (raw === undefined && run.status === "blocked") continue;
+      const { output } = acceptedOutputSchema.parse(raw);
+      acceptedOutputs++;
+      if (run.status === "blocked")
+        add(
+          path.join(store.directory(id), artifact),
+          `outputs/${stage.id}-${agent.id}.json`,
+        );
       const folders = agent.allowedFolders ?? snapshot.allowedFolders ?? [];
       const included = new Set<string>();
       const report =
@@ -146,9 +144,7 @@ export function runAssets(store: RunStore, id: string): Uint8Array {
         included.add(resolved);
       }
 
-      if (stage.id !== snapshot.workflow.stages.at(-1)?.id) continue;
       for (const file of new Set(fileReferences(output))) {
-        // Final outputs also cite source paths; only export within pinned grants.
         if (containingFolder(file, folders) < 0) continue;
         const stat = fs.lstatSync(file);
         if (stat.isDirectory()) continue;
@@ -170,5 +166,7 @@ export function runAssets(store: RunStore, id: string): Uint8Array {
       }
     }
   }
+  if (!acceptedOutputs && run.status === "blocked")
+    fail("This blocked run has no accepted final-stage outputs to download.");
   return zipSync(files);
 }

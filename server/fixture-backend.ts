@@ -20,6 +20,54 @@ export function fixtureBackend(): AgentBackend {
       });
       if (request.purpose === "schema")
         return JSON.parse(JSON.stringify(request.input));
+      if (request.purpose === "watch-schedule") {
+        const plans: Record<
+          string,
+          {
+            description: string;
+            expressions: string[];
+            intervalMinutes: number | null;
+          }
+        > = {
+          "every day at 7am": {
+            description: "Every day at 07:00",
+            expressions: ["0 7 * * *"],
+            intervalMinutes: null,
+          },
+          "Every day at 7am and 7 pm": {
+            description: "Every day at 07:00 and 19:00",
+            expressions: ["0 7,19 * * *"],
+            intervalMinutes: null,
+          },
+          "every 5 min": {
+            description: "Every 5 minutes",
+            expressions: [],
+            intervalMinutes: 5,
+          },
+          "every 15 min": {
+            description: "Every 15 minutes",
+            expressions: [],
+            intervalMinutes: 15,
+          },
+        };
+        const input = request.input;
+        const schedule =
+          input && typeof input === "object" && !Array.isArray(input)
+            ? input.schedule
+            : undefined;
+        const plan = typeof schedule === "string" ? plans[schedule] : undefined;
+        return {
+          status: plan ? "ready" : "unsupported",
+          reason: plan
+            ? "Fixture schedule compilation only; no natural-language interpretation."
+            : "Describe a specific time or interval.",
+          ...(plan ?? {
+            description: "Unsupported fixture schedule",
+            expressions: [],
+            intervalMinutes: null,
+          }),
+        };
+      }
       if (request.purpose === "watch-condition")
         return {
           status: "ready",

@@ -32,12 +32,15 @@ import type { Selection } from "./inspector.tsx";
 import { StageNode } from "./stage-node.tsx";
 import type { StageCanvasNode } from "./stage-node.tsx";
 import { describeLoopCondition } from "./loop-labels.ts";
+import { isAction, workflowPath } from "../../shared/workflow-kind.ts";
+import { ActionEditor } from "./action-editor.tsx";
 
 const nodeTypes = { stage: StageNode };
 const newStage = () =>
   stageSchema.parse({
     id: `step-${crypto.randomUUID().slice(0, 8)}`,
     name: "New stage",
+    expectedOutput: "Return a concise summary of the result.",
     outputSchema: {
       type: "object",
       required: ["summary"],
@@ -45,11 +48,16 @@ const newStage = () =>
     },
     agents: [{ id: "agent", name: "Agent" }],
   });
-const newWorkflow = () =>
+const newWorkflow = (action: boolean) =>
   workflowSchema.parse({
     id: `workflow-${crypto.randomUUID().slice(0, 8)}`,
-    name: "Untitled workflow",
+    name: action ? "Untitled action" : "Untitled workflow",
     description: "",
+    ...(action
+      ? {
+          expectedInput: "A required Context text field describing what to do.",
+        }
+      : {}),
     inputSchema: {
       type: "object",
       required: ["context"],
@@ -57,29 +65,36 @@ const newWorkflow = () =>
         context: { type: "string", title: "Context", minLength: 1 },
       },
     },
-    stages: [newStage()],
+    stages: action ? [newStage()] : [newStage(), newStage()],
   });
 
-export function WorkflowBuilder() {
+export function WorkflowBuilder({ action = false }: { action?: boolean }) {
   const { id } = useParams();
   const navigate = useNavigate();
   const resource = useResource<Saved<Workflow>>(
     id ? `/pipelines/${id}` : undefined,
   );
   const skills = useResource<Saved<Skill>[]>("/skills");
-  const [workflow, setWorkflow] = useState<Workflow>(newWorkflow);
+  const [workflow, setWorkflow] = useState<Workflow>(() => newWorkflow(action));
+  const actionItem = isAction(workflow);
+  const collectionPath = actionItem ? "/actions" : "/pipelines";
   const [revision, setRevision] = useState<string>();
   const [selection, setSelection] = useState<Selection>();
   const [error, setError] = useState("");
   const [invalid, setInvalid] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const mutationLocked = useRef(false);
   const [deleting, setDeleting] = useState(false);
   const [dirty, setDirty] = useState(!id);
   const [nodes, setNodes, onNodesChange] = useNodesState<StageCanvasNode>([]);
+  function fieldError(key: string, message: string) {
+    setInvalid((current) => ({ ...current, [key]: message }));
+    setError("");
+  }
   function select(next?: Selection) {
     if (Object.values(invalid).some(Boolean)) {
-      setError("Fix invalid fields before leaving this inspector.");
+      setError("Fix invalid fields before continuing.");
       return;
     }
     setSelection(next);
@@ -91,11 +106,11 @@ export function WorkflowBuilder() {
       setDirty(false);
       setSelection(undefined);
     } else if (!id) {
-      setWorkflow(newWorkflow());
+      setWorkflow(newWorkflow(action));
       setRevision(undefined);
       setDirty(true);
     }
-  }, [id, resource.data]);
+  }, [id, resource.data, action]);
   useEffect(() => {
     setNodes((current) =>
       workflow.stages.map((stage, index) => ({
@@ -224,7 +239,7 @@ export function WorkflowBuilder() {
     }
   }
   async function save(duplicate = false) {
-    if (mutationLocked.current) return;
+    if (mutationLocked.current || uploading) return;
     mutationLocked.current = true;
     setBusy(true);
     setError("");
@@ -252,7 +267,7 @@ export function WorkflowBuilder() {
       setRevision(saved.revision);
       setDirty(false);
       setSelection(undefined);
-      navigate(`/pipelines/${saved.value.id}`, { replace: true });
+      navigate(workflowPath(saved.value), { replace: true });
     } catch (failure) {
       setError(errorMessage(failure));
     } finally {
@@ -277,7 +292,7 @@ export function WorkflowBuilder() {
         method: "DELETE",
         body: JSON.stringify({ revision }),
       });
-      navigate("/pipelines", { replace: true });
+      navigate(collectionPath, { replace: true });
     } catch (failure) {
       setError(errorMessage(failure));
     } finally {
@@ -297,9 +312,9 @@ export function WorkflowBuilder() {
     <div className="builder-page">
       <header className="builder-header">
         <Link
-          to="/pipelines"
+          to={collectionPath}
           className="icon-button"
-          aria-label="Back to workflows"
+          aria-label={actionItem ? "Back to actions" : "Back to workflows"}
         >
           <ArrowLeft size={18} />
         </Link>
@@ -307,23 +322,29 @@ export function WorkflowBuilder() {
           <h1>{workflow.name}</h1>
           <span>
             {dirty ? "Unsaved changes" : "All changes saved"} ·{" "}
-            {workflow.stages.length} stages
+            {actionItem
+              ? "Single-step action"
+              : `${workflow.stages.length} stages`}
           </span>
         </div>
-        <button className="button" onClick={() => select({ kind: "workflow" })}>
+        <button
+          className="button"
+          disabled={busy || uploading}
+          onClick={() => select({ kind: "workflow" })}
+        >
           <Settings2 size={15} />
           Settings
         </button>
         <button
           className="icon-button"
-          aria-label="Duplicate workflow"
-          disabled={busy}
+          aria-label={actionItem ? "Duplicate action" : "Duplicate workflow"}
+          disabled={busy || uploading}
           onClick={() => void save(true)}
         >
           <Copy size={16} />
         </button>
-        {revision && !dirty && (
-          <Link className="button" to={`/pipelines/${workflow.id}/run`}>
+        {revision && !dirty && !uploading && (
+          <Link className="button" to={`${workflowPath(workflow)}/run`}>
             <Play size={14} />
             Run
           </Link>
@@ -331,7 +352,7 @@ export function WorkflowBuilder() {
         {id && revision && (
           <button
             className="button danger"
-            disabled={busy}
+            disabled={busy || uploading}
             onClick={() => void deleteWorkflow()}
           >
             <Trash2 size={14} />
@@ -340,7 +361,7 @@ export function WorkflowBuilder() {
         )}
         <button
           className="button primary"
-          disabled={busy}
+          disabled={busy || uploading}
           onClick={() => void save()}
         >
           <Save size={15} />
@@ -356,96 +377,106 @@ export function WorkflowBuilder() {
         }
       />
       <div className="builder-body">
-        <div className="canvas">
-          <div className="canvas-toolbar">
-            <span>WORKFLOW CANVAS</span>
-            <button
-              className="button"
-              disabled={busy}
-              onClick={() =>
+        {actionItem ? (
+          <ActionEditor
+            workflow={workflow}
+            update={update}
+            disabled={busy || uploading}
+            error={fieldError}
+            uploading={setUploading}
+          />
+        ) : (
+          <div className="canvas">
+            <div className="canvas-toolbar">
+              <span>WORKFLOW CANVAS</span>
+              <button
+                className="button"
+                disabled={busy}
+                onClick={() =>
+                  update({
+                    ...workflow,
+                    stages: [...workflow.stages, newStage()],
+                  })
+                }
+              >
+                <Plus size={15} />
+                Add stage
+              </button>
+            </div>
+            {workflow.stages.some((stage) => stage.loop) && (
+              <div className="canvas-loops" aria-label="Workflow loops">
+                {workflow.stages.map(
+                  (stage, index) =>
+                    stage.loop && (
+                      <button
+                        key={stage.id}
+                        className="canvas-loop-summary"
+                        aria-label={`Edit loop: ${stage.name}`}
+                        onClick={() =>
+                          select({ kind: "stage", stageId: stage.id })
+                        }
+                      >
+                        <strong>
+                          <Repeat2 size={15} /> {stage.name} decision
+                        </strong>
+                        <span>If {describeLoopCondition(stage.loop)}</span>
+                        <span>
+                          Back to{" "}
+                          <b>
+                            {
+                              workflow.stages.find(
+                                (item) => item.id === stage.loop?.targetStageId,
+                              )?.name
+                            }
+                          </b>{" "}
+                          · up to {stage.loop.maxIterations} passes
+                        </span>
+                        <small>
+                          Otherwise:{" "}
+                          {workflow.stages[index + 1]
+                            ? `continue to ${workflow.stages[index + 1].name}`
+                            : "finish workflow"}
+                        </small>
+                      </button>
+                    ),
+                )}
+              </div>
+            )}
+            <ReactFlow
+              nodes={nodes}
+              edges={edges}
+              nodeTypes={nodeTypes}
+              onNodesChange={changeNodes}
+              onNodeDragStop={(_event, node) =>
                 update({
                   ...workflow,
-                  stages: [...workflow.stages, newStage()],
+                  layout: { ...workflow.layout, [node.id]: node.position },
                 })
               }
+              onConnect={connect}
+              onEdgeClick={(_event, edge) => {
+                const stage = workflow.stages.find(
+                  (item) => `loop-${item.id}` === edge.id,
+                );
+                if (stage) select({ kind: "stage", stageId: stage.id });
+              }}
+              nodesDraggable={!busy}
+              nodesConnectable={!busy}
+              onPaneClick={() => select()}
+              fitView
+              minZoom={0.25}
+              maxZoom={1.5}
+              proOptions={{ hideAttribution: true }}
             >
-              <Plus size={15} />
-              Add stage
-            </button>
-          </div>
-          {workflow.stages.some((stage) => stage.loop) && (
-            <div className="canvas-loops" aria-label="Workflow loops">
-              {workflow.stages.map(
-                (stage, index) =>
-                  stage.loop && (
-                    <button
-                      key={stage.id}
-                      className="canvas-loop-summary"
-                      aria-label={`Edit loop: ${stage.name}`}
-                      onClick={() =>
-                        select({ kind: "stage", stageId: stage.id })
-                      }
-                    >
-                      <strong>
-                        <Repeat2 size={15} /> {stage.name} decision
-                      </strong>
-                      <span>If {describeLoopCondition(stage.loop)}</span>
-                      <span>
-                        Back to{" "}
-                        <b>
-                          {
-                            workflow.stages.find(
-                              (item) => item.id === stage.loop?.targetStageId,
-                            )?.name
-                          }
-                        </b>{" "}
-                        · up to {stage.loop.maxIterations} passes
-                      </span>
-                      <small>
-                        Otherwise:{" "}
-                        {workflow.stages[index + 1]
-                          ? `continue to ${workflow.stages[index + 1].name}`
-                          : "finish workflow"}
-                      </small>
-                    </button>
-                  ),
-              )}
+              <Background color="#d5d5d1" gap={22} size={1} />
+              <Controls showInteractive={false} />
+              <FitWorkflow />
+            </ReactFlow>
+            <div className="canvas-hint">
+              Drag to arrange · Connect to reorder · Click an agent to configure
             </div>
-          )}
-          <ReactFlow
-            nodes={nodes}
-            edges={edges}
-            nodeTypes={nodeTypes}
-            onNodesChange={changeNodes}
-            onNodeDragStop={(_event, node) =>
-              update({
-                ...workflow,
-                layout: { ...workflow.layout, [node.id]: node.position },
-              })
-            }
-            onConnect={connect}
-            onEdgeClick={(_event, edge) => {
-              const stage = workflow.stages.find(
-                (item) => `loop-${item.id}` === edge.id,
-              );
-              if (stage) select({ kind: "stage", stageId: stage.id });
-            }}
-            nodesDraggable={!busy}
-            nodesConnectable={!busy}
-            onPaneClick={() => select()}
-            fitView
-            minZoom={0.25}
-            maxZoom={1.5}
-            proOptions={{ hideAttribution: true }}
-          >
-            <Background color="#d5d5d1" gap={22} size={1} />
-            <Controls showInteractive={false} />
-            <FitWorkflow />
-          </ReactFlow>
-          <div className="canvas-hint">
-            Drag to arrange · Connect to reorder · Click an agent to configure
           </div>
-        </div>
+        )}
         {selection && (
           <Inspector
             workflow={workflow}
@@ -454,10 +485,17 @@ export function WorkflowBuilder() {
             update={update}
             close={() => select()}
             blocked={Object.values(invalid).some(Boolean)}
-            disabled={busy}
-            error={(key, message) =>
-              setInvalid((current) => ({ ...current, [key]: message }))
+            disabled={busy || uploading}
+            addStage={
+              actionItem
+                ? () =>
+                    update({
+                      ...workflow,
+                      stages: [...workflow.stages, newStage()],
+                    })
+                : undefined
             }
+            error={fieldError}
           />
         )}
       </div>

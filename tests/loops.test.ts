@@ -142,6 +142,83 @@ function fixture(
   return { store, run, calls, counts, backend, execute };
 }
 
+test("plain-language loops return complete review feedback automatically and enforce the pass limit", async (t) => {
+  for (const alwaysRepeat of [false, true]) {
+    await t.test(
+      alwaysRepeat ? "bounded retry" : "fix then publish",
+      async (t) => {
+        const value = definition();
+        for (const stage of value.stages) {
+          stage.expectedOutput = `Return the result of ${stage.name}.`;
+          stage.inputs = {};
+        }
+        const closing = value.stages[2];
+        closing.loop = {
+          targetStageId: "transform",
+          repeatWhen:
+            "The review finds actionable defects or failing required tests.",
+          condition: {
+            agentId: "meter",
+            pointer: "/needsAnotherPass",
+            operator: "equals",
+            value: true,
+          },
+          maxIterations: 3,
+          feedback: {},
+        };
+        const review = (pass: number) => ({
+          needsAnotherPass: alwaysRepeat || pass === 1,
+          findings:
+            alwaysRepeat || pass === 1
+              ? [{ file: "feature.ts", line: 42, comment: "Fix recovery." }]
+              : [],
+        });
+        const { store, run, calls, counts, execute } = fixture(
+          t,
+          (stage, pass) =>
+            stage === "measure"
+              ? review(pass)
+              : { summary: `${stage}-${pass}` },
+          value,
+        );
+        await execute();
+        const result = store.get(run.id);
+        assert.equal(
+          result.status,
+          alwaysRepeat ? "blocked" : "completed",
+          result.error,
+        );
+        assert.equal(counts.get("prepare/setup"), 1);
+        assert.equal(counts.get("transform/worker"), alwaysRepeat ? 3 : 2);
+        assert.equal(counts.get("ship/writer"), alwaysRepeat ? undefined : 1);
+        assert.deepEqual(calls[0].input, { context: "Generic cycle" });
+        assert.deepEqual(calls[1].input, { summary: "prepare-1" });
+        assert.deepEqual(calls[3].input, review(1));
+        assert.match(
+          calls[2].prompt,
+          /Repeat when: The review finds actionable defects/,
+        );
+        assert.deepEqual(
+          unitDetails(store, run.id, "visit-4:transform/worker").input
+            .stageInput,
+          review(1),
+        );
+        if (alwaysRepeat)
+          assert.match(result.error!, /maximum of 3 total passes/);
+        else assert.deepEqual(calls.at(-1)!.input, review(2));
+        const count = calls.length;
+        await execute();
+        assert.equal(
+          calls.length,
+          count,
+          "Replay must not repeat accepted work.",
+        );
+        store.verify(run.id);
+      },
+    );
+  }
+});
+
 test("generic loop passes feedback, executes fresh visits, and continues with only final handoffs", async (t) => {
   const { store, run, calls, counts, execute } = fixture(t);
   await execute();
@@ -187,14 +264,10 @@ test("generic loop passes feedback, executes fresh visits, and continues with on
   );
   assert.equal(store.get(run.id).status, "completed");
   const assets = unzipSync(runAssets(store, run.id));
-  assert.equal(
-    JSON.parse(strFromU8(assets["execution/state.json"])).visits.length,
-    6,
-  );
-  assert.deepEqual(
-    JSON.parse(strFromU8(assets["execution/input-visit-4.json"])).stageInput,
-    calls[3].input,
-  );
+  assert.deepEqual(Object.keys(assets), ["result.json"]);
+  assert.deepEqual(JSON.parse(strFromU8(assets["result.json"])), [
+    { summary: "ship", input: { evidence: "measurement-2" } },
+  ]);
   store.verify(run.id);
 });
 

@@ -37,7 +37,12 @@ for (const [modern, allowAllTools, model] of [
     const options = [
       ...commonOptions,
       ...(modern
-        ? ["--trust-folder", "--disable-client-telemetry", "--sync-session"]
+        ? [
+            "--trust-folder",
+            "--disable-client-telemetry",
+            "--sync-session",
+            "--additional-mcp-config",
+          ]
         : ["--no-remote-export"]),
     ];
     const script = path.join(root, "copilot.js");
@@ -78,6 +83,7 @@ if (args.includes("--help")) {
             model,
             allowAllTools,
             allowedFolders,
+            ...(modern ? { paths: { CHECKOUT: allowedFolders[0] } } : {}),
           },
           new AbortController().signal,
         ),
@@ -103,6 +109,18 @@ if (args.includes("--help")) {
       assert.equal(args.includes("--available-tools"), !allowAllTools);
       assert.equal(args.includes("--disable-builtin-mcps"), !allowAllTools);
       assert.equal(args.includes("--allow-all-urls"), allowAllTools);
+      assert.equal(args.includes("--additional-mcp-config"), modern);
+      if (modern) {
+        const config = JSON.parse(
+          args[args.indexOf("--additional-mcp-config") + 1],
+        );
+        assert.deepEqual(config.mcpServers["strand-paths"].tools, ["get_path"]);
+        assert.deepEqual(
+          JSON.parse(fs.readFileSync(path.join(root, "paths.json"), "utf8")),
+          { CHECKOUT: allowedFolders[0] },
+        );
+        if (!allowAllTools) assert(args.includes("strand-paths"));
+      }
       assert.deepEqual(
         args.flatMap((arg, index) =>
           arg === "--add-dir" ? [args[index + 1]] : [],
@@ -110,6 +128,14 @@ if (args.includes("--help")) {
         [root, ...allowedFolders],
       );
       const prompt = fs.readFileSync(path.join(root, "prompt.md"), "utf8");
+      assert.match(prompt, /runtime failure envelope/);
+      assert.match(prompt, /"failed" when the task was attempted/);
+      assert.match(
+        prompt,
+        /Both stop the run without publishing a successful result/,
+      );
+      assert.match(prompt, /even when the success schema is a primitive/);
+      assert.match(prompt, /including 0, to represent failure/);
       if (allowedFolders.length) {
         assert(prompt.includes(JSON.stringify(allowedFolders)));
         assert(!prompt.includes("Do not write outside this attempt directory"));

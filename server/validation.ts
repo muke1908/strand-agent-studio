@@ -1,63 +1,37 @@
-import { Ajv } from "ajv";
-import { Ajv2020 } from "ajv/dist/2020.js";
-import type {
-  Json,
-  Schema,
-  Skill,
-  Stage,
-  Workflow,
-} from "../shared/contracts.ts";
+import type { Json, Skill, Stage, Workflow } from "../shared/contracts.ts";
 import { validateReferences } from "../shared/bindings.ts";
+import { createJsonValidator } from "../shared/json-schema.ts";
 
-const createAjv = (schema: Schema) => {
-  const Validator =
-    schema.$schema === "https://json-schema.org/draft/2020-12/schema"
-      ? Ajv2020
-      : Ajv;
-  return new Validator({
-    strict: false,
-    allErrors: true,
-    validateSchema: true,
-  });
-};
-export function validateJson(schema: Schema, value: Json): void {
-  const ajv = createAjv(schema);
-  const check = ajv.compile(schema);
-  if (!check(value))
-    throw Object.assign(
-      new Error(ajv.errorsText(check.errors, { separator: "; " })),
-      { status: 400 },
-    );
-}
+export { validateJson } from "../shared/json-schema.ts";
 
 export function assertStageNotBlocked(
   stage: Stage,
   outputs: Record<string, Json>,
 ): void {
-  const blocked = stage.agents.filter((agent) => {
+  const failures = stage.agents.flatMap((agent) => {
     const output = outputs[`${stage.id}/${agent.id}`];
-    return (
-      output !== null &&
+    return output !== null &&
       typeof output === "object" &&
       !Array.isArray(output) &&
-      output.status === "blocked"
-    );
+      (output.status === "blocked" || output.status === "failed")
+      ? [`${agent.name} reported status "${output.status}"`]
+      : [];
   });
-  if (blocked.length)
+  if (failures.length)
     throw Object.assign(
       new Error(
-        `${stage.name}: ${blocked.map((agent) => agent.name).join(", ")} reported status "blocked". Resolve the blockers and rerun from "${stage.name}"; Resume reuses accepted outputs.`,
+        `${stage.name}: ${failures.join(", ")}. Resolve the issues and rerun from "${stage.name}"; Resume reuses accepted outputs.`,
       ),
       { status: 409 },
     );
 }
 
 export function validateWorkflow(workflow: Workflow, skills: Skill[]): void {
-  createAjv(workflow.inputSchema).compile(workflow.inputSchema);
+  createJsonValidator(workflow.inputSchema).compile(workflow.inputSchema);
   validateReferences(workflow);
   const ids = new Set(skills.map((skill) => skill.id));
   for (const stage of workflow.stages) {
-    createAjv(stage.outputSchema).compile(stage.outputSchema);
+    createJsonValidator(stage.outputSchema).compile(stage.outputSchema);
     const requested = [
       ...stage.skills,
       ...stage.agents.flatMap((agent) => agent.skills),

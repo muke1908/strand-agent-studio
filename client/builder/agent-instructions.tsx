@@ -7,9 +7,11 @@ import { ErrorNotice, Loading } from "../components.tsx";
 export function AgentInstructions({
   agent,
   onChange,
+  workflowId,
 }: {
   agent: Agent;
   onChange: (agent: Agent) => void;
+  workflowId: string;
 }) {
   const [choosing, setChoosing] = useState(false);
   function choose(file: string) {
@@ -66,6 +68,7 @@ export function AgentInstructions({
           }
           onSelect={choose}
           onClose={() => setChoosing(false)}
+          workflowId={workflowId}
         />
       )}
     </>
@@ -76,10 +79,12 @@ function InstructionPicker({
   initialDirectory,
   onSelect,
   onClose,
+  workflowId,
 }: {
   initialDirectory?: string;
   onSelect: (file: string) => void;
   onClose: () => void;
+  workflowId: string;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [directory, setDirectory] = useState(initialDirectory);
@@ -98,7 +103,7 @@ function InstructionPicker({
     setError("");
     setListing(undefined);
     void api<InstructionDirectory>(
-      `/instruction-files${directory ? `?directory=${encodeURIComponent(directory)}` : ""}`,
+      `/instruction-files?workflowId=${encodeURIComponent(workflowId)}${directory ? `&directory=${encodeURIComponent(directory)}` : ""}`,
       { signal: controller.signal },
     )
       .then((value) => {

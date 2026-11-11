@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import { CronExpressionParser } from "cron-parser";
 import { z } from "zod";
 import { jsonValue } from "../shared/contracts.ts";
 import type {
@@ -21,6 +20,7 @@ import type { RunHost } from "./run-host.ts";
 import { WorkflowBusyError } from "./run-host.ts";
 import type { WatchPolicy } from "./watch-policies.ts";
 import { compareValues } from "./conditions.ts";
+import { readWatchSchedule } from "../shared/watch-schedule.ts";
 
 const stateSchema: z.ZodType<WatchState> = z.object({
   id: z.string(),
@@ -90,15 +90,14 @@ export function createWatcher(
     const policy = policies.find((item) => item.id === watch.policyId);
     if (!policy) throw new Error("Unknown watcher policy");
     validateJson(policy.settingsSchema, watch.settings);
-    if (watch.policyId === "schedule-cron") {
-      const expression = watch.settings.expression;
-      const zone = watch.settings.timeZone;
-      if (typeof expression !== "string" || typeof zone !== "string")
-        throw new Error("Cron expression and time zone are required");
-      new Intl.DateTimeFormat("en", { timeZone: zone });
-      CronExpressionParser.parse(expression, { tz: zone });
+    if (watch.policyId === "schedule-cron") readWatchSchedule(watch.settings);
+    const workflow = catalog.workflow(watch.workflowId).value;
+    if (watch.input !== undefined) {
+      if (Object.keys(watch.inputBindings).length)
+        throw new Error("Provide either input or input bindings, not both");
+      if (typeof watch.input !== "string")
+        validateJson(workflow.inputSchema, watch.input);
     }
-    catalog.workflow(watch.workflowId);
     for (const ref of Object.values(watch.inputBindings)) {
       if (ref.source !== "literal" && ref.source !== "trigger")
         throw new Error("Watch inputs must use trigger fields or literals");
@@ -106,7 +105,14 @@ export function createWatcher(
     }
     if (watch.action) {
       catalog.workflow(watch.action.workflowId);
-      for (const ref of Object.values(watch.action.inputBindings)) {
+      if (watch.action.input && Object.keys(watch.action.inputBindings).length)
+        throw new Error(
+          "Provide either action input or input bindings, not both",
+        );
+      for (const ref of [
+        ...(watch.action.input ? [watch.action.input] : []),
+        ...Object.values(watch.action.inputBindings),
+      ]) {
         if (!["literal", "input", "trigger"].includes(ref.source))
           throw new Error(
             "Action inputs must use literals, check input or check result",
@@ -343,21 +349,29 @@ export function createWatcher(
           finish(watch, current, now);
           return true;
         }
-        const input = Object.fromEntries(
-          Object.entries(action.inputBindings).map(([name, ref]) => [
-            name,
-            resolveReference(
-              ref,
+        const input = action.input
+          ? resolveReference(
+              action.input,
               host.store.snapshot(check.id).input,
               {},
               result,
-            ),
-          ]),
-        );
-        validateJson(
-          catalog.workflow(action.workflowId).value.inputSchema,
-          input,
-        );
+            )
+          : Object.fromEntries(
+              Object.entries(action.inputBindings).map(([name, ref]) => [
+                name,
+                resolveReference(
+                  ref,
+                  host.store.snapshot(check.id).input,
+                  {},
+                  result,
+                ),
+              ]),
+            );
+        if (typeof input !== "string")
+          validateJson(
+            catalog.workflow(action.workflowId).value.inputSchema,
+            input,
+          );
         decision.action = {
           requestId: `watch-action-${digest({ watchId: watch.id, checkRunId: check.id })}`,
           input,
@@ -415,83 +429,88 @@ export function createWatcher(
     return false;
   }
   async function evaluate(watch: Watch, now = new Date()): Promise<WatchState> {
-    if (!watch.enabled) return state(watch.id);
     const release = claim(itemPath(root, "watch-claims", watch.id));
-    const current = state(watch.id);
-    const file = itemPath(root, "watch-state", watch.id);
     try {
       watch = catalog.watch(watch.id).value;
+      const current = state(watch.id);
+      const file = itemPath(root, "watch-state", watch.id);
       if (!watch.enabled) return current;
-      validate(watch);
-      if (watch.action && cycle(watch, current, now)) return current;
-      const policy = policies.find((item) => item.id === watch.policyId)!;
-      const observation = await policy.evaluate(
-        watch.settings,
-        current.cursor,
-        now,
-      );
-      for (const candidate of watch.action
-        ? observation.candidates.slice(-1)
-        : observation.candidates) {
-        if (
-          current.decisions.some(
-            (item) =>
-              item.eventId === candidate.eventId &&
-              item.resourceId === candidate.resourceId,
+      try {
+        validate(watch);
+        if (watch.action && cycle(watch, current, now)) return current;
+        const policy = policies.find((item) => item.id === watch.policyId)!;
+        const observation = await policy.evaluate(
+          watch.settings,
+          current.cursor,
+          now,
+        );
+        for (const candidate of watch.action
+          ? observation.candidates.slice(-1)
+          : observation.candidates) {
+          if (
+            current.decisions.some(
+              (item) =>
+                item.eventId === candidate.eventId &&
+                item.resourceId === candidate.resourceId,
+            )
           )
-        )
-          continue;
-        const input = Object.fromEntries(
-          Object.entries(watch.inputBindings).map(([key, ref]) => [
-            key,
-            resolveReference(ref, null, {}, candidate.payload),
-          ]),
-        );
-        validateJson(
-          catalog.workflow(watch.workflowId).value.inputSchema,
-          input,
-        );
-        for (const old of current.decisions.filter(
-          (item) =>
-            item.status === "pending" &&
-            item.resourceId === candidate.resourceId,
-        ))
-          old.status = "superseded";
-        current.decisions.push({
-          eventId: candidate.eventId,
-          resourceId: candidate.resourceId,
-          reason: candidate.reason,
-          input,
-          observedAt: now.toISOString(),
-          status: "pending",
-        });
-      }
-      current.cursor = observation.cursor;
-      current.lastChecked = now.toISOString();
-      current.nextCheck = new Date(now.getTime() + 60000).toISOString();
-      if (watch.action) current.phase = "watching";
-      delete current.error;
-      writeJson(file, current);
-      dispatch(watch.id, current, now);
-    } catch (error) {
-      current.error = error instanceof Error ? error.message : String(error);
-      if (watch.action) {
-        const decision = current.decisions.findLast(
-          (item) => item.status === "launched" && !item.outcome,
-        );
-        if (decision) {
-          decision.outcome = "error";
-          decision.error = current.error;
+            continue;
+          const input =
+            watch.input !== undefined
+              ? watch.input
+              : Object.fromEntries(
+                  Object.entries(watch.inputBindings).map(([key, ref]) => [
+                    key,
+                    resolveReference(ref, null, {}, candidate.payload),
+                  ]),
+                );
+          if (typeof input !== "string")
+            validateJson(
+              catalog.workflow(watch.workflowId).value.inputSchema,
+              input,
+            );
+          for (const old of current.decisions.filter(
+            (item) =>
+              item.status === "pending" &&
+              item.resourceId === candidate.resourceId,
+          ))
+            old.status = "superseded";
+          current.decisions.push({
+            eventId: candidate.eventId,
+            resourceId: candidate.resourceId,
+            reason: candidate.reason,
+            input,
+            observedAt: now.toISOString(),
+            status: "pending",
+          });
         }
-        finish(watch, current, now, current.error);
-      } else {
-        current.nextCheck = new Date(now.getTime() + 120000).toISOString();
+        current.cursor = observation.cursor;
+        current.lastChecked = now.toISOString();
+        current.nextCheck = new Date(now.getTime() + 60000).toISOString();
+        if (watch.action) current.phase = "watching";
+        delete current.error;
         writeJson(file, current);
+        dispatch(watch.id, current, now);
+      } catch (error) {
+        current.error = error instanceof Error ? error.message : String(error);
+        if (watch.action) {
+          const decision = current.decisions.findLast(
+            (item) => item.status === "launched" && !item.outcome,
+          );
+          if (decision) {
+            decision.outcome = "error";
+            decision.error = current.error;
+          }
+          finish(watch, current, now, current.error);
+        } else {
+          current.nextCheck = new Date(now.getTime() + 120000).toISOString();
+          writeJson(file, current);
+        }
       }
+      return current;
     } finally {
       release();
     }
-    return current;
   }
   function dispatch(id: string, current: WatchState, now: Date) {
     const watch = catalog.watch(id).value;
@@ -586,6 +605,7 @@ export function createWatcher(
         for (const { value: watch } of catalog.watches()) {
           if (
             watch.enabled &&
+            fs.existsSync(itemPath(root, "watches", watch.id)) &&
             Date.parse(state(watch.id).nextCheck) <= now.getTime()
           )
             await evaluate(watch, now);

@@ -3,8 +3,14 @@ import type { Page } from "@playwright/test";
 import fs from "node:fs";
 import path from "node:path";
 import { unzipSync, strFromU8 } from "fflate";
-import type { QueueState, Run } from "../../shared/contracts.ts";
+import type {
+  QueueState,
+  Run,
+  RunDetails,
+  RunSummary,
+} from "../../shared/contracts.ts";
 import { temporaryRoot, workflow } from "../helpers.ts";
+import telemetryInputSchema from "../fixtures/telemetry-input-schema.json" with { type: "json" };
 
 const test = base.extend<{ instructionFile: string }>({
   instructionFile: async ({ browserName }, use) => {
@@ -38,6 +44,352 @@ async function chooseInstructionFile(page: Page, file: string) {
     .getByRole("button", { name: path.basename(file), exact: true })
     .click();
 }
+
+test("single-step actions have their own searchable collection and overview group", async ({
+  page,
+}) => {
+  const assigned = workflow("assigned-prs");
+  assigned.name = "PR inbox";
+  assigned.description = "PRs assigned to me";
+  assigned.stages = [assigned.stages[0]];
+  const comments = structuredClone(assigned);
+  comments.id = "pr-comments";
+  comments.name = "Comment pulse";
+  comments.description = "PR open comment count";
+  const process = workflow("review-process");
+  process.name = "Review and report";
+  const loop = structuredClone(assigned);
+  loop.id = "retry-check";
+  loop.name = "Check until ready";
+  loop.stages[0].loop = {
+    targetStageId: loop.stages[0].id,
+    condition: {
+      agentId: loop.stages[0].agents[0].id,
+      pointer: "/summary",
+      operator: "equals",
+      value: "retry",
+    },
+    maxIterations: 3,
+    feedback: {},
+  };
+  await page.route("**/api/pipelines", (route) =>
+    route.fulfill({
+      json: [assigned, comments, process, loop].map((value) => ({
+        value,
+        revision: value.id,
+      })),
+    }),
+  );
+  await page.goto("/pipelines");
+  await expect(
+    page.getByRole("heading", { name: "Workflows", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("link").filter({ hasText: process.name }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("link").filter({ hasText: loop.name }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("link").filter({ hasText: assigned.name }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("navigation")
+    .getByRole("link", { name: "Actions", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Actions", exact: true }),
+  ).toBeVisible();
+  const inbox = page.getByRole("link").filter({ hasText: assigned.name });
+  await expect(inbox).toHaveAttribute("href", "/actions/assigned-prs");
+  await expect(inbox).toContainText("Single step");
+  await expect(
+    page.getByRole("link").filter({ hasText: process.name }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("link").filter({ hasText: loop.name }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("textbox", { name: "Search actions" })
+    .fill("comment count");
+  await expect(
+    page.getByRole("link").filter({ hasText: comments.name }),
+  ).toBeVisible();
+  await expect(inbox).toHaveCount(0);
+  await page
+    .getByRole("textbox", { name: "Search actions" })
+    .fill("no matching task");
+  await expect(
+    page.getByText("Your next small win", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("navigation")
+    .getByRole("link", { name: "Overview", exact: true })
+    .click();
+  const workflows = page.getByRole("region", {
+    name: "Your workflows",
+    exact: true,
+  });
+  const actions = page.getByRole("region", {
+    name: "Your actions",
+    exact: true,
+  });
+  await expect(
+    workflows.getByRole("heading", { name: process.name }),
+  ).toBeVisible();
+  await expect(
+    workflows.getByRole("heading", { name: assigned.name }),
+  ).toHaveCount(0);
+  await expect(
+    actions.getByRole("heading", { name: assigned.name }),
+  ).toBeVisible();
+  await expect(
+    actions.getByRole("heading", { name: process.name }),
+  ).toHaveCount(0);
+});
+
+test("actions can be created, run and expanded into workflows without changing their identity", async ({
+  page,
+}) => {
+  await page.goto("/actions");
+  await page.getByRole("link", { name: "New action", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Untitled action" }),
+  ).toBeVisible();
+  await expect(page.getByRole("application")).toHaveCount(0);
+  await expect(
+    page.getByRole("textbox", { name: "Expected input", exact: false }),
+  ).toHaveValue("A required Context text field describing what to do.");
+  await expect(
+    page.getByRole("textbox", { name: "Input schema", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("textbox", { name: "Expected output", exact: false }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("textbox", { name: "Output schema", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByLabel("Upload Markdown", { exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const name = `PR inbox ${crypto.randomUUID().slice(0, 8)}`;
+  await page.getByLabel("Name", { exact: true }).fill(name);
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page).toHaveURL(/\/actions\/workflow-/);
+  const id = page.url().split("/").at(-1)!;
+  await page.reload();
+  await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Run", exact: true }).click();
+  await expect(
+    page.getByRole("link", { name: "Back to action", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("textbox", { name: "Context", exact: false })
+    .fill("Check my assigned PRs.");
+  await page.getByRole("button", { name: "Run action", exact: true }).click();
+  await expect(page).toHaveURL(/\/runs\/run-/);
+  await page.goto(`/actions/${id}`);
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Convert to workflow", exact: true })
+    .click();
+  await expect(page.getByRole("application")).toBeVisible();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page).toHaveURL(`/pipelines/${id}`);
+  await page
+    .getByRole("link", { name: "Back to workflows", exact: true })
+    .click();
+  await expect(page.getByRole("link").filter({ hasText: name })).toBeVisible();
+  await page
+    .getByRole("navigation")
+    .getByRole("link", { name: "Actions", exact: true })
+    .click();
+  await expect(page.getByRole("link").filter({ hasText: name })).toHaveCount(0);
+  await page
+    .getByRole("navigation")
+    .getByRole("link", { name: "Workflows", exact: true })
+    .click();
+  await page.getByRole("link", { name: "New workflow", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Untitled workflow" }),
+  ).toBeVisible();
+  await expect(page.getByText("2 stages", { exact: false })).toBeVisible();
+});
+
+test("the action editor saves expected output and uploaded Markdown while preserving existing action settings", async ({
+  page,
+  instructionFile,
+}) => {
+  const definition = workflow(
+    `action-editor-${crypto.randomUUID().slice(0, 8)}`,
+  );
+  definition.stages = [definition.stages[0]];
+  definition.stages[0].agents = [definition.stages[0].agents[0]];
+  definition.stages[0].agents[0].instructionsFile = instructionFile;
+  definition.inputSchema = {
+    ...definition.inputSchema,
+    properties: {
+      context: { type: "string", title: "PR context" },
+      prUrl: { type: "string", title: "PR URL" },
+    },
+  };
+  await expect(
+    await page.request.put(`/api/pipelines/${definition.id}`, {
+      data: { value: definition },
+    }),
+  ).toBeOK();
+  await page.goto(`/actions/${definition.id}`);
+  await expect(page.getByRole("application")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Add stage", exact: true }),
+  ).toHaveCount(0);
+  const file = page.getByRole("status", { name: "Agent instructions file" });
+  await expect(file).toHaveText(path.basename(instructionFile));
+  const expectedInput =
+    "A required PR context text field and an optional PR URL text field.";
+  const expectedOutput =
+    "Return a short summary and the number of open comments.";
+  const input = page.getByRole("textbox", {
+    name: "Expected input",
+    exact: false,
+  });
+  await expect(input).toBeEmpty();
+  await input.fill(expectedInput);
+  await page
+    .getByRole("textbox", { name: "Expected output", exact: false })
+    .fill(expectedOutput);
+  const upload = page.getByLabel("Upload Markdown", { exact: true });
+  for (const [name, content, message] of [
+    ["instructions.txt", "Not Markdown", "Choose a Markdown (.md) file."],
+    ["instructions.md", " \n ", "Markdown instructions cannot be empty."],
+    ["instructions.md", "a".repeat(50001), "cannot exceed 50,000 characters"],
+  ]) {
+    await upload.setInputFiles({
+      name,
+      mimeType: "text/markdown",
+      buffer: Buffer.from(content),
+    });
+    await expect(page.getByRole("alert")).toContainText(message);
+    await expect(file).toHaveText(path.basename(instructionFile));
+  }
+  const instructions =
+    "# PR inbox\nCount open PR comments and return evidence.";
+  await upload.setInputFiles({
+    name: "pr-inbox.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from(instructions),
+  });
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.getByText("View saved instructions", { exact: true }).click();
+  await expect(page.getByText(instructions, { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(
+    page.getByText("All changes saved", { exact: false }),
+  ).toBeVisible();
+  await page.reload();
+  await expect(input).toHaveValue(expectedInput);
+  await expect(
+    page.getByRole("textbox", { name: "Expected output", exact: false }),
+  ).toHaveValue(expectedOutput);
+  await page.getByText("View saved instructions", { exact: true }).click();
+  await expect(page.getByText(instructions, { exact: true })).toBeVisible();
+  const saved = await (
+    await page.request.get(`/api/pipelines/${definition.id}`)
+  ).json();
+  expect(saved.value.expectedInput).toBe(expectedInput);
+  expect(saved.value.inputSchema).toEqual(definition.inputSchema);
+  expect(saved.value.stages[0]).toEqual({
+    ...definition.stages[0],
+    expectedOutput,
+    inputs: {},
+    agents: [
+      {
+        ...definition.stages[0].agents[0],
+        instructionsFile: undefined,
+        instructions,
+      },
+    ],
+  });
+  await page.getByRole("link", { name: "Run", exact: true }).click();
+  await page
+    .getByRole("textbox", { name: "PR context", exact: false })
+    .fill("Check my assigned PRs.");
+  await page.getByRole("button", { name: "Run action", exact: true }).click();
+  await expect(page).toHaveURL(/\/runs\/run-/);
+  await expect
+    .poll(async () => {
+      const response = await page.request.get(
+        `/api/pipeline-runs/${page.url().split("/").at(-1)}`,
+      );
+      return (await response.json()).status;
+    })
+    .toBe("completed");
+});
+
+test("invalid telemetry inputs stay on the launch form without creating a run", async ({
+  page,
+}) => {
+  const definition = workflow(`input-ui-${crypto.randomUUID().slice(0, 8)}`);
+  definition.inputSchema = telemetryInputSchema;
+  await expect(
+    await page.request.put(`/api/pipelines/${definition.id}`, {
+      data: { value: definition },
+    }),
+  ).toBeOK();
+  await page.goto(`/pipelines/${definition.id}`);
+  await page.getByRole("link", { name: "Run", exact: true }).click();
+  await page
+    .getByLabel("context", { exact: false })
+    .fill("Investigate code paths.");
+  const start = page.getByRole("textbox", {
+    name: "Telemetry start (UTC)",
+    exact: true,
+  });
+  const end = page.getByRole("textbox", {
+    name: "Telemetry end (UTC)",
+    exact: true,
+  });
+  await start.fill("Ignore telemetry");
+  await end.fill("Ignore telemetry");
+  let submissions = 0;
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      request.url().endsWith(`/pipelines/${definition.id}/runs`)
+    )
+      submissions++;
+  });
+  await page.getByRole("button", { name: "Run workflow", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText('format "date-time"');
+  expect(submissions).toBe(0);
+  const invalid = await page.request.post(
+    `/api/pipelines/${definition.id}/runs`,
+    {
+      data: {
+        input: {
+          context: "Invalid API input",
+          telemetryStartUtc: "Ignore telemetry",
+        },
+        requestId: crypto.randomUUID(),
+      },
+    },
+  );
+  expect(invalid.status()).toBe(400);
+  await start.fill("2026-11-09T07:00:00Z");
+  await end.fill("2026-11-09T06:00:00Z");
+  await page.getByRole("button", { name: "Run workflow", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("should be >");
+  expect(submissions).toBe(0);
+  await start.fill("");
+  await end.fill("");
+  await page
+    .getByLabel("Scope hints", { exact: true })
+    .fill("No Kusto required.");
+  await page.getByRole("button", { name: "Run workflow", exact: true }).click();
+  await expect(page).toHaveURL(/\/runs\/run-/);
+  expect(submissions).toBe(1);
+});
 
 test("workflow queue setting persists and launches appear in Queue history", async ({
   page,
@@ -172,10 +524,120 @@ test("Queue history shows mixed statuses, polls updates and exposes empty and er
   await expect(page.getByRole("alert")).toHaveText("Queue unavailable");
 });
 
-test("show the latest 10 runs per workflow, refreshed independently by polling", async ({
+test("workflow and action run histories stay separate and details return to the correct history", async ({
   page,
 }) => {
-  let runs: Run[] = Array.from({ length: 26 }, (_, index) => {
+  const workflowRun: RunSummary = {
+    id: "run-separate-workflow",
+    workflowId: "changing-definition",
+    workflowName: "Original workflow",
+    kind: "workflow",
+    status: "completed",
+    createdAt: "2026-11-10T12:00:00Z",
+    updatedAt: "2026-11-10T12:00:00Z",
+    requestId: "separate-workflow",
+    units: {},
+  };
+  const actionRun: RunSummary = {
+    ...workflowRun,
+    id: "run-separate-action",
+    workflowName: "Focused action",
+    kind: "action",
+    requestId: "separate-action",
+    trigger: {
+      watchId: "comment-watch",
+      eventId: "comments",
+      reason: "New review comments",
+    },
+  };
+  let runs = [actionRun, workflowRun];
+  const detail: RunDetails = {
+    ...actionRun,
+    stages: [],
+    result: { status: "completed", count: 3 },
+    resultSummary: { status: "completed", lines: ["Found three comments."] },
+  };
+  await page.route("**/api/pipeline-runs", (route) =>
+    route.fulfill({ json: runs }),
+  );
+  await page.route(`**/api/pipeline-runs/${actionRun.id}`, (route) =>
+    route.fulfill({ json: detail }),
+  );
+  await page.route(`**/api/pipeline-runs/${actionRun.id}/logs`, (route) =>
+    route.fulfill({ json: { content: "" } }),
+  );
+  await page.route(
+    "**/api/pipelines/changing-definition/run-history?kind=action",
+    async (route) => {
+      expect(route.request().method()).toBe("DELETE");
+      runs = runs.filter((run) => run.kind !== "action");
+      await route.fulfill({ json: { deleted: 1 } });
+    },
+  );
+  await page.goto("/");
+  const recentWorkflows = page.getByRole("region", {
+    name: "Recent workflow runs",
+  });
+  const recentActions = page.getByRole("region", {
+    name: "Recent action runs",
+  });
+  await expect(recentWorkflows).toContainText(workflowRun.workflowName);
+  await expect(recentWorkflows).not.toContainText(actionRun.workflowName);
+  await expect(recentActions).toContainText(actionRun.workflowName);
+  await expect(recentActions).not.toContainText(workflowRun.workflowName);
+  const navigation = page.getByRole("navigation", { name: "Main navigation" });
+  await navigation
+    .getByRole("link", { name: "Workflow runs", exact: true })
+    .click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(
+    "Workflow runs",
+  );
+  await expect(
+    page.getByRole("heading", { name: workflowRun.workflowName, exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: actionRun.workflowName, exact: true }),
+  ).toHaveCount(0);
+  await navigation
+    .getByRole("link", { name: "Action runs", exact: true })
+    .click();
+  await expect(page).toHaveURL("/action-runs");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(
+    "Action runs",
+  );
+  await expect(
+    page.getByRole("heading", { name: actionRun.workflowName, exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: workflowRun.workflowName, exact: true }),
+  ).toHaveCount(0);
+  await page.getByRole("link", { name: /^Open latest run/ }).click();
+  await expect(page).toHaveURL(`/runs/${actionRun.id}`);
+  const back = page.getByRole("link", { name: "All action runs", exact: true });
+  await expect(back).toHaveAttribute("href", "/action-runs");
+  await back.click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page
+    .getByRole("button", { name: "Delete Focused action history" })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "No action runs yet", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: "Explore actions", exact: true }),
+  ).toHaveAttribute("href", "/actions");
+  await navigation
+    .getByRole("link", { name: "Workflow runs", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: workflowRun.workflowName, exact: true }),
+  ).toBeVisible();
+});
+
+test("workflow cards link every active run and keep the latest 10 runs refreshed by polling", async ({
+  page,
+}, testInfo) => {
+  let runs: RunSummary[] = Array.from({ length: 26 }, (_, index) => {
     const workflowId =
       index >= 24
         ? "old-workflow"
@@ -184,6 +646,7 @@ test("show the latest 10 runs per workflow, refreshed independently by polling",
           : "pr-assistant";
     return {
       id: `run-history-${index}`,
+      kind: "workflow",
       workflowId,
       workflowName:
         workflowId === "feature"
@@ -193,7 +656,7 @@ test("show the latest 10 runs per workflow, refreshed independently by polling",
               ? "Old PR Assistant name"
               : "PR Assistant"
             : "Old workflow",
-      status: index === 0 ? "running" : "completed",
+      status: index === 0 ? "running" : index === 22 ? "queued" : "completed",
       createdAt: new Date(Date.UTC(2026, 10, 4, 17, 30 - index)).toISOString(),
       updatedAt: "2026-11-04T17:30:00Z",
       requestId: `history-${index}`,
@@ -220,28 +683,51 @@ test("show the latest 10 runs per workflow, refreshed independently by polling",
     name: "Old workflow",
     exact: true,
   });
-  await expect(history.getByRole("link")).toHaveCount(22);
+  await expect(
+    feature.getByRole("link", { name: /^Open active run/ }),
+  ).toHaveCount(2);
+  await expect(feature.getByText("2 active", { exact: true })).toBeVisible();
+  await expect(
+    feature.getByRole("link", { name: /Open active run.*queued/ }),
+  ).toHaveAttribute("href", "/runs/run-history-22");
+  await expect(
+    assistant.getByRole("link", { name: /^Open latest run/ }),
+  ).toHaveAttribute("href", "/runs/run-history-1");
+  await expect(
+    feature
+      .getByRole("link", { name: /Open active run.*running/ })
+      .getByText("running", { exact: true }),
+  ).toBeVisible();
+  await expect(history.getByRole("link")).toHaveCount(4);
+  await page.screenshot({
+    path: testInfo.outputPath("run-cards-desktop.png"),
+    fullPage: true,
+  });
+  const featureHistory = feature.locator("details");
+  const assistantHistory = assistant.locator("details");
+  const oldHistory = old.locator("details");
+  for (const details of [featureHistory, assistantHistory, oldHistory])
+    await details.locator("summary").click();
   await expect(history.getByRole("heading", { level: 2 })).toHaveText([
     "Feature development",
     "PR Assistant",
     "Old workflow",
   ]);
-  await expect(feature.getByRole("link")).toHaveCount(10);
-  await expect(assistant.getByRole("link")).toHaveCount(10);
-  await expect(old.getByRole("link")).toHaveCount(2);
-  await expect(feature.getByRole("link").first()).toHaveAttribute(
+  await expect(featureHistory.getByRole("link")).toHaveCount(10);
+  await expect(assistantHistory.getByRole("link")).toHaveCount(10);
+  await expect(oldHistory.getByRole("link")).toHaveCount(2);
+  await expect(featureHistory.getByRole("link").first()).toHaveAttribute(
     "href",
     "/runs/run-history-0",
   );
-  await expect(feature.getByRole("link").last()).toHaveAttribute(
+  await expect(featureHistory.getByRole("link").last()).toHaveAttribute(
     "href",
     "/runs/run-history-18",
   );
-  await expect(assistant.getByRole("link").last()).toHaveAttribute(
+  await expect(assistantHistory.getByRole("link").last()).toHaveAttribute(
     "href",
     "/runs/run-history-19",
   );
-  await expect(feature.getByText("running", { exact: true })).toBeVisible();
   await expect(history.locator('a[href="/runs/run-history-20"]')).toHaveCount(
     0,
   );
@@ -262,14 +748,13 @@ test("show the latest 10 runs per workflow, refreshed independently by polling",
     },
     ...runs,
   ];
-  await expect(assistant.getByRole("link").first()).toHaveAttribute(
-    "href",
-    "/runs/run-history-new",
-  );
-  await expect(history.getByRole("link")).toHaveCount(22);
-  await expect(feature.getByRole("link")).toHaveCount(10);
-  await expect(assistant.getByRole("link")).toHaveCount(10);
-  await expect(old.getByRole("link")).toHaveCount(2);
+  await expect(
+    assistant.getByRole("link", { name: /^Open latest run/ }),
+  ).toHaveAttribute("href", "/runs/run-history-new");
+  await expect(history.getByRole("link")).toHaveCount(26);
+  await expect(featureHistory.getByRole("link")).toHaveCount(10);
+  await expect(assistantHistory.getByRole("link")).toHaveCount(10);
+  await expect(oldHistory.getByRole("link")).toHaveCount(2);
   await expect(history.getByRole("heading", { level: 2 })).toHaveText([
     "PR Assistant",
     "Feature development",
@@ -278,22 +763,26 @@ test("show the latest 10 runs per workflow, refreshed independently by polling",
   await expect(history.locator('a[href="/runs/run-history-19"]')).toHaveCount(
     0,
   );
-  await expect(feature.getByRole("link").last()).toHaveAttribute(
+  await expect(featureHistory.getByRole("link").last()).toHaveAttribute(
     "href",
     "/runs/run-history-18",
   );
-  await expect(assistant.getByRole("link").last()).toHaveAttribute(
+  await expect(assistantHistory.getByRole("link").last()).toHaveAttribute(
     "href",
     "/runs/run-history-17",
   );
   await expect(
-    assistant.getByText("Scheduled run", { exact: true }),
+    assistantHistory.getByText("Scheduled run", { exact: true }),
   ).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(feature.getByRole("heading")).toBeVisible();
   expect(
     await page.evaluate(() => document.documentElement.scrollWidth),
   ).toBeLessThanOrEqual(390);
+  await page.screenshot({
+    path: testInfo.outputPath("run-cards-mobile.png"),
+    fullPage: true,
+  });
 });
 
 test("run history keeps empty and API error states visible", async ({
@@ -317,6 +806,118 @@ test("run history keeps empty and API error states visible", async ({
   ).toHaveAttribute("href", "/pipelines");
   failed = true;
   await expect(page.getByRole("alert")).toHaveText("Run history unavailable");
+});
+
+test("run history confirms individual and whole-group deletion and protects active runs", async ({
+  page,
+}) => {
+  let runs: RunSummary[] = Array.from({ length: 14 }, (_, index) => ({
+    id: `run-delete-${index}`,
+    kind: "workflow",
+    workflowId: index < 12 ? "history" : "active",
+    workflowName: index < 12 ? "History workflow" : "Active workflow",
+    status: index === 12 ? "running" : index === 13 ? "queued" : "completed",
+    createdAt: new Date(Date.UTC(2026, 10, 7, 12, 30 - index)).toISOString(),
+    updatedAt: "2026-11-07T12:30:00Z",
+    requestId: `delete-${index}`,
+    units: {},
+  }));
+  let failed = false;
+  const deleted: string[] = [];
+  await page.route("**/api/pipeline-runs", (route) =>
+    route.fulfill({ json: runs }),
+  );
+  await page.route("**/api/pipeline-runs/run-delete-*", async (route) => {
+    expect(route.request().method()).toBe("DELETE");
+    if (failed) {
+      await route.fulfill({
+        status: 409,
+        json: { error: "Run became active. Stop it before deleting." },
+      });
+      return;
+    }
+    const id = route.request().url().split("/").pop()!;
+    deleted.push(id);
+    runs = runs.filter((run) => run.id !== id);
+    await route.fulfill({ json: { deleted: true } });
+  });
+  await page.route(
+    "**/api/pipelines/history/run-history?kind=workflow",
+    async (route) => {
+      expect(route.request().method()).toBe("DELETE");
+      deleted.push("group");
+      const count = runs.filter((run) => run.workflowId === "history").length;
+      runs = runs.filter((run) => run.workflowId !== "history");
+      await route.fulfill({ json: { deleted: count } });
+    },
+  );
+  await page.goto("/runs");
+  const history = page.getByRole("region", {
+    name: "History workflow",
+    exact: true,
+  });
+  const active = page.getByRole("region", {
+    name: "Active workflow",
+    exact: true,
+  });
+  const groupDelete = history.getByRole("button", {
+    name: "Delete History workflow history",
+    exact: true,
+  });
+  await expect(groupDelete).toBeEnabled();
+  await expect(
+    active.getByRole("button", {
+      name: "Delete Active workflow history",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  await active.locator("summary").click();
+  for (const id of ["run-delete-12", "run-delete-13"])
+    await expect(
+      active.getByRole("button", {
+        name: `Delete run ${id} from history`,
+        exact: true,
+      }),
+    ).toBeDisabled();
+  await history.locator("summary").click();
+  const runDelete = history.getByRole("button", {
+    name: "Delete run run-delete-0 from history",
+    exact: true,
+  });
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await runDelete.click();
+  await expect(runDelete).toBeVisible();
+  expect(deleted).toEqual([]);
+  failed = true;
+  page.once("dialog", (dialog) => dialog.accept());
+  await runDelete.click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "Run became active. Stop it before deleting.",
+  );
+  await expect(runDelete).toBeEnabled();
+  failed = false;
+  page.once("dialog", (dialog) => dialog.accept());
+  await runDelete.click();
+  await expect(runDelete).toHaveCount(0);
+  await expect(history.locator("details").getByRole("link")).toHaveCount(10);
+  await expect(history.locator('a[href="/runs/run-delete-10"]')).toBeVisible();
+  expect(deleted).toEqual(["run-delete-0"]);
+  await page.reload();
+  await expect(
+    history.getByRole("link", { name: /^Open latest run/ }),
+  ).toHaveAttribute("href", "/runs/run-delete-1");
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await groupDelete.click();
+  await expect(history).toBeVisible();
+  expect(deleted).toEqual(["run-delete-0"]);
+  page.once("dialog", async (dialog) => {
+    expect(dialog.message()).toContain("including older runs");
+    await dialog.accept();
+  });
+  await groupDelete.click();
+  await expect(history).toHaveCount(0);
+  await expect(active).toBeVisible();
+  expect(deleted).toEqual(["run-delete-0", "group"]);
 });
 
 test("configure a generic conditional loop and inspect immutable pass history and feedback", async ({
@@ -855,11 +1456,53 @@ test("completed runs download a ZIP and show download errors without leaving the
   const file = await download.path();
   if (!file) throw new Error("Download file is missing.");
   const archive = unzipSync(fs.readFileSync(file));
-  expect(archive["execution/snapshot.json"]).toBeDefined();
-  expect(strFromU8(archive["execution/result.json"])).toContain(
+  expect(Object.keys(archive)).toEqual(["result.json"]);
+  expect(strFromU8(archive["result.json"])).toContain(
     "Fixture output - automated testing only",
   );
   await expect(page.getByRole("alert")).not.toBeVisible();
+});
+
+test("blocked final publication still exposes the asset download without marking the run completed", async ({
+  page,
+}) => {
+  const definition = workflow(
+    `blocked-download-${crypto.randomUUID().slice(0, 8)}`,
+  );
+  definition.stages[1].outputSchema.properties = {
+    summary: { type: "string" },
+    status: { type: "string", enum: ["blocked"] },
+  };
+  await expect(
+    await page.request.put(`/api/pipelines/${definition.id}`, {
+      data: { value: definition },
+    }),
+  ).toBeOK();
+  const launched = await page.request.post(
+    `/api/pipelines/${definition.id}/runs`,
+    {
+      data: {
+        input: { context: "Preserve accepted report on upload failure." },
+        requestId: crypto.randomUUID(),
+      },
+    },
+  );
+  await expect(launched).toBeOK();
+  const run = await launched.json();
+  await page.goto(`/runs/${run.id}`);
+  const button = page.getByRole("button", { name: "Download assets" });
+  await expect(button).toBeVisible();
+  const downloading = page.waitForEvent("download");
+  await button.click();
+  const download = await downloading;
+  expect(await download.failure()).toBeNull();
+  const file = await download.path();
+  if (!file) throw new Error("Download file is missing.");
+  const archive = unzipSync(fs.readFileSync(file));
+  expect(JSON.parse(strFromU8(archive["run-status.json"])).status).toBe(
+    "blocked",
+  );
+  expect(Object.hasOwn(archive, "result.json")).toBe(false);
 });
 
 test("a blocked outcome stops execution and leaves later stages unexecuted", async ({
@@ -901,22 +1544,22 @@ test("a blocked outcome stops execution and leaves later stages unexecuted", asy
     discover.getByRole("button", { name: "View Alpha input and output" }),
   ).toContainText("blocked");
   await expect(
-    discover.getByRole("button", { name: "Rerun from Discover" }),
+    discover.getByRole("button", { name: "Re-run from Discover" }),
   ).toBeEnabled();
   await expect(
-    discover.getByRole("button", { name: "Restart from Discover" }),
-  ).toBeEnabled();
+    discover.getByRole("button", { name: /^Restart from / }),
+  ).toHaveCount(0);
   const report = page.getByRole("region", { name: "Report stage" });
   await expect(report).toHaveAccessibleDescription("Not executed");
   await expect(
     report.getByRole("button", { name: "View Writer input and output" }),
   ).toHaveCount(0);
   await expect(
-    report.getByRole("button", { name: "Rerun from Report" }),
+    report.getByRole("button", { name: "Re-run from Report" }),
   ).toBeDisabled();
   await expect(
-    report.getByRole("button", { name: "Restart from Report" }),
-  ).toBeDisabled();
+    report.getByRole("button", { name: /^Restart from / }),
+  ).toHaveCount(0);
   const stored = await (
     await page.request.get(`/api/pipeline-runs/${run.id}`)
   ).json();
@@ -934,7 +1577,7 @@ test("a blocked outcome stops execution and leaves later stages unexecuted", asy
       request.method() === "POST" &&
       request.url().endsWith(`/pipeline-runs/${run.id}/rerun`),
   );
-  await discover.getByRole("button", { name: "Restart from Discover" }).click();
+  await discover.getByRole("button", { name: "Re-run from Discover" }).click();
   expect((await restarting).postDataJSON()).toMatchObject({
     stageId: "discover",
     latestInstructions: true,
@@ -990,7 +1633,7 @@ test("saving prevents inspector and canvas edits from being silently discarded",
   ).toHaveText(path.basename(instructionFile));
 });
 
-test("configure independent agent folders, persist them, and launch with restricted tools", async ({
+test("agent settings use shared configured folders instead of a per-agent folder editor", async ({
   page,
 }) => {
   const root = temporaryRoot();
@@ -998,11 +1641,6 @@ test("configure independent agent folders, persist them, and launch with restric
   const otherFolder = path.join(root, "another project");
   fs.mkdirSync(folder);
   fs.mkdirSync(otherFolder);
-  const alphaFolders = [
-    fs.realpathSync(folder),
-    fs.realpathSync(otherFolder),
-  ].sort();
-  const betaFolders = [fs.realpathSync(otherFolder)];
   const definition = workflow(
     `folder-access-${crypto.randomUUID().slice(0, 8)}`,
   );
@@ -1014,39 +1652,25 @@ test("configure independent agent folders, persist them, and launch with restric
     await page.goto(`/pipelines/${definition.id}`);
     await page.getByRole("button", { name: "Alpha Backend default" }).click();
     const folders = page.getByRole("textbox", { name: /^Allowed folders/ });
-    await expect(folders).toBeEmpty();
-    await folders.fill("relative/project");
-    await page.getByRole("button", { name: "Save", exact: true }).click();
-    await expect(page.getByRole("alert")).toContainText(
-      "must be an absolute path",
-    );
-    await folders.fill(folder);
-    await folders.press("End");
-    await folders.press("Enter");
-    await expect(folders).toHaveValue(`${folder}\n`);
-    await folders.fill(`${folder}\n${otherFolder}\n${folder}`);
-    await page.getByRole("button", { name: "Beta Backend default" }).click();
-    await expect(folders).toBeEmpty();
-    await folders.fill(otherFolder);
-    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(folders).toHaveCount(0);
     await expect(
-      page.getByText("All changes saved", { exact: false }),
+      page.getByText("All agents share the folders configured", {
+        exact: false,
+      }),
     ).toBeVisible();
+    await page.getByRole("button", { name: "Beta Backend default" }).click();
+    await expect(folders).toHaveCount(0);
     const stored = await (
       await page.request.get(`/api/pipelines/${definition.id}`)
     ).json();
-    expect(stored.value.stages[0].agents[0].allowedFolders).toEqual(
-      alphaFolders,
-    );
-    expect(stored.value.stages[0].agents[1].allowedFolders).toEqual(
-      betaFolders,
-    );
+    expect(stored.value.stages[0].agents[0].allowedFolders).toBeUndefined();
+    expect(stored.value.stages[0].agents[1].allowedFolders).toBeUndefined();
     expect(stored.value.stages[1].agents[0].allowedFolders).toBeUndefined();
     await page.reload();
     await page.getByRole("button", { name: "Alpha Backend default" }).click();
-    await expect(folders).toHaveValue(alphaFolders.join("\n"));
+    await expect(folders).toHaveCount(0);
     await page.getByRole("button", { name: "Beta Backend default" }).click();
-    await expect(folders).toHaveValue(betaFolders.join("\n"));
+    await expect(folders).toHaveCount(0);
     await page.getByRole("button", { name: "Close inspector" }).click();
     await page.getByRole("link", { name: "Run", exact: true }).click();
     await expect(folders).toHaveCount(0);
@@ -1074,7 +1698,7 @@ test("configure independent agent folders, persist them, and launch with restric
       .click();
     const dialog = page.getByRole("dialog", { name: "Beta" });
     const input = dialog.getByRole("region", { name: "Input", exact: true });
-    await expect(input).toContainText(betaFolders[0]);
+    await expect(input).toContainText("allowedFolders");
     await expect(input).not.toContainText(fs.realpathSync(folder));
     await dialog
       .getByRole("button", { name: "Close activity details" })
@@ -1114,6 +1738,75 @@ test("delete a workflow only after confirmation and remove it from the gallery",
   expect((await page.request.get(`/api/pipelines/${id}`)).status()).toBe(404);
 });
 
+test("plain-language output and repeat rules save without schema or feedback binding editors", async ({
+  page,
+}) => {
+  const definition = workflow(
+    `natural-loop-${crypto.randomUUID().slice(0, 8)}`,
+  );
+  for (const stage of definition.stages) {
+    stage.expectedOutput = `Return the complete ${stage.name} result.`;
+    stage.inputs = {};
+  }
+  await expect(
+    await page.request.put(`/api/pipelines/${definition.id}`, {
+      data: { value: definition },
+    }),
+  ).toBeOK();
+  await page.goto(`/pipelines/${definition.id}`);
+  await page.getByRole("button", { name: "02 Report", exact: true }).click();
+  const repeat = page.getByRole("checkbox", {
+    name: "Repeat earlier stages when a condition matches",
+  });
+  await repeat.check();
+  const rule = "The review finds defects or missing required test coverage.";
+  await page
+    .getByRole("textbox", { name: "Repeat when", exact: false })
+    .fill(rule);
+  await expect(
+    page.getByRole("region", { name: "Loop preview" }),
+  ).toContainText(rule);
+  for (const name of [
+    "Input bindings",
+    "Output schema",
+    "Loop feedback bindings",
+    "Custom field path",
+  ])
+    await expect(page.getByRole("textbox", { name, exact: true })).toHaveCount(
+      0,
+    );
+  await expect(
+    page.getByRole("combobox", { name: "Output field", exact: true }),
+  ).toHaveCount(0);
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(
+    page.getByText("All changes saved", { exact: false }),
+  ).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "02 Report", exact: true }).click();
+  await expect(
+    page.getByRole("textbox", { name: "Repeat when", exact: false }),
+  ).toHaveValue(rule);
+  await expect(
+    page.getByRole("textbox", { name: "Expected output", exact: false }),
+  ).toHaveValue(definition.stages[1].expectedOutput!);
+  const saved = await (
+    await page.request.get(`/api/pipelines/${definition.id}`)
+  ).json();
+  expect(saved.value.stages[1].loop).toEqual({
+    targetStageId: "discover",
+    condition: {
+      agentId: "writer",
+      pointer: "/needsAnotherPass",
+      operator: "equals",
+      value: true,
+    },
+    repeatWhen: rule,
+    maxIterations: 3,
+    feedback: {},
+  });
+});
+
 test("build, configure agents, save, reload, and run a user-composed workflow", async ({
   page,
   instructionFile,
@@ -1126,9 +1819,17 @@ test("build, configure agents, save, reload, and run a user-composed workflow", 
   await page.getByRole("button", { name: "Close inspector" }).click();
   await page.getByRole("button", { name: "01 New stage", exact: true }).click();
   await page.getByLabel("Stage name").fill("Understand");
+  await expect(page.getByLabel("Stage instructions")).toHaveCount(0);
+  const expectedOutput = "Return the scope and a short implementation plan.";
   await page
-    .getByLabel("Stage instructions")
-    .fill("Analyze supplied evidence without assuming missing facts.");
+    .getByRole("textbox", { name: "Expected output", exact: false })
+    .fill(expectedOutput);
+  await expect(
+    page.getByRole("textbox", { name: "Input bindings", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("textbox", { name: "Output schema", exact: true }),
+  ).toHaveCount(0);
   await page.getByRole("button", { name: "Add agent", exact: true }).click();
   await page.getByRole("button", { name: "Close inspector" }).click();
   await page.getByRole("button", { name: "New agent Backend default" }).click();
@@ -1151,6 +1852,8 @@ test("build, configure agents, save, reload, and run a user-composed workflow", 
   const workflowId = page.url().split("/").at(-1);
   const savedResponse = await page.request.get(`/api/pipelines/${workflowId}`);
   const saved = await savedResponse.json();
+  expect(saved.value.stages[0].expectedOutput).toBe(expectedOutput);
+  expect(saved.value.stages[0].inputs).toEqual({});
   expect(Object.keys(saved.value.layout)).toHaveLength(1);
   const persistedLayout = saved.value.layout;
   await page.reload();
@@ -1219,7 +1922,7 @@ test("build, configure agents, save, reload, and run a user-composed workflow", 
   ).toContainText("Cross-check claims against supplied evidence.");
   await expect(
     agentDialog.getByRole("region", { name: "Input", exact: true }),
-  ).toContainText("Analyze supplied evidence without assuming missing facts.");
+  ).not.toContainText("stageInstructions");
   await expect(
     agentDialog.getByRole("region", { name: "Output", exact: true }),
   ).toContainText("Fixture output - automated testing only");
@@ -1269,7 +1972,7 @@ test("clearing optional numeric and enum inputs removes the previously selected 
   await page.getByLabel("count").clear();
   await page.getByRole("combobox", { name: "mode" }).selectOption('"large"');
   await page.getByRole("combobox", { name: "mode" }).selectOption("");
-  await page.getByRole("button", { name: "Run workflow" }).click();
+  await page.getByRole("button", { name: "Run action", exact: true }).click();
   await expect(page).toHaveURL(/\/runs\/run-/);
   expect(submitted).toEqual({});
   const runId = page.url().split("/").at(-1);
@@ -1296,12 +1999,14 @@ test("invalid JSON remains visible and cannot silently save an older value", asy
   ).toBeVisible();
 });
 
-test("import a reusable Markdown skill and register, pause, and edit a watch", async ({
+test("import a reusable Markdown skill and register, pause, edit and delete a watch", async ({
   page,
 }) => {
+  const skillName = `Evidence standards ${crypto.randomUUID().slice(0, 8)}`;
+  const watchName = `Daily triage ${crypto.randomUUID().slice(0, 8)}`;
   await page.goto("/skills");
   await page.getByRole("button", { name: "New skill" }).click();
-  await page.getByLabel("Skill name").fill("Evidence standards");
+  await page.getByLabel("Skill name").fill(skillName);
   await page.getByLabel("Import Markdown").setInputFiles({
     name: "evidence.md",
     mimeType: "text/markdown",
@@ -1311,12 +2016,10 @@ test("import a reusable Markdown skill and register, pause, and edit a watch", a
     "# Evidence\nSeparate observations from assumptions.",
   );
   await page.getByRole("button", { name: "Save skill" }).click();
-  await expect(
-    page.getByRole("button", { name: /Evidence standards/ }),
-  ).toBeVisible();
+  await expect(page.getByRole("button", { name: skillName })).toBeVisible();
   await page.goto("/watches");
   await page.getByRole("button", { name: "New watch" }).click();
-  await page.getByLabel("Watch name").fill("Daily triage");
+  await page.getByLabel("Watch name").fill(watchName);
   await expect(
     page.getByRole("checkbox", { name: "Allow all tools for scheduled runs" }),
   ).not.toBeChecked();
@@ -1324,21 +2027,23 @@ test("import a reusable Markdown skill and register, pause, and edit a watch", a
     .getByRole("checkbox", { name: "Allow all tools for scheduled runs" })
     .check();
   await page
-    .getByRole("combobox", { name: "Workflow", exact: true })
+    .getByRole("combobox", { name: "Action or workflow", exact: true })
     .selectOption({ label: "Bug triage" });
   await page
-    .getByLabel("Workflow input bindings")
-    .fill('{"context":{"source":"literal","value":"Recurring bug context"}}');
+    .getByRole("textbox", { name: "Input", exact: true })
+    .fill("Recurring bug context");
   await page.getByRole("button", { name: "Save watch" }).click();
   await expect(
-    page.getByRole("button", { name: "Daily triage", exact: true }),
+    page.getByRole("button", { name: watchName, exact: true }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Pause Daily triage" }).click();
+  await page.getByRole("button", { name: `Pause ${watchName}` }).click();
   await expect(
-    page.getByRole("button", { name: "Enable Daily triage" }),
+    page.getByRole("button", { name: `Enable ${watchName}` }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Daily triage", exact: true }).click();
-  await expect(page.getByLabel("Cron expression")).toHaveValue("0 9 * * 1-5");
+  await page.getByRole("button", { name: watchName, exact: true }).click();
+  await expect(page.getByLabel("Schedule", { exact: true })).toHaveValue(
+    "every day at 7am",
+  );
   await expect(
     page.getByRole("checkbox", { name: "Allow all tools for scheduled runs" }),
   ).toBeChecked();
@@ -1346,9 +2051,53 @@ test("import a reusable Markdown skill and register, pause, and edit a watch", a
     .getByRole("checkbox", { name: "Allow all tools for scheduled runs" })
     .uncheck();
   await page.getByRole("button", { name: "Save watch" }).click();
-  await page.getByRole("button", { name: "Daily triage", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Edit watch", exact: true }),
+  ).toBeHidden();
+  await page.reload();
+  await page.getByRole("button", { name: watchName, exact: true }).click();
   await expect(
     page.getByRole("checkbox", { name: "Allow all tools for scheduled runs" }),
   ).not.toBeChecked();
   await page.getByRole("button", { name: "Close watch editor" }).click();
+
+  const card = page.getByRole("region", { name: watchName, exact: true });
+  const remove = card.getByRole("button", {
+    name: `Delete ${watchName}`,
+    exact: true,
+  });
+  let deletions = 0;
+  await page.route("**/api/pipeline-watches/*", async (route) => {
+    if (route.request().method() === "DELETE" && ++deletions === 1)
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: "This watch changed. Reload before deleting.",
+        }),
+      });
+    else await route.continue();
+  });
+  page.once("dialog", async (dialog) => {
+    expect(dialog.message()).toContain(
+      "Existing runs and results will be kept",
+    );
+    await dialog.dismiss();
+  });
+  await remove.click();
+  await expect(card).toBeVisible();
+  expect(deletions).toBe(0);
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await remove.click();
+  await expect(page.getByRole("alert")).toContainText("Reload before deleting");
+  await expect(card).toBeVisible();
+  await expect(remove).toBeEnabled();
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await remove.click();
+  await expect(card).toHaveCount(0);
+  expect(deletions).toBe(2);
+  await page.reload();
+  await expect(card).toHaveCount(0);
 });

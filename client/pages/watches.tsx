@@ -1,14 +1,13 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { Plus, Radio, X, Pause, Play } from "lucide-react";
+import { Plus, Radio, X, Pause, Play, Trash2 } from "lucide-react";
 import {
   watchRegistrationSchema,
   watchSchema,
+  jsonValue,
 } from "../../shared/contracts.ts";
 import type {
-  Json,
   Saved,
-  Schema,
   Watch,
   WatchState,
   WatchActionRequest,
@@ -22,20 +21,20 @@ import {
   PageHeader,
   StatusBadge,
 } from "../components.tsx";
-import { SchemaForm } from "../forms/schema-form.tsx";
 import { WatchDecisionReason, WatchTiming } from "../watch-timing.tsx";
+import { readWatchSchedule } from "../../shared/watch-schedule.ts";
 
-type Policy = {
-  id: string;
-  name: string;
-  description: string;
-  settingsSchema: Schema;
-};
+function defaultSettings() {
+  return {
+    schedule: "every day at 7am",
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  };
+}
+
 type WatchItem = Saved<Watch> & { state: WatchState };
 export function Watches() {
   const resource = useResource<WatchItem[]>("/pipeline-watches", true);
   const workflows = useResource<Saved<Workflow>[]>("/pipelines");
-  const policies = useResource<Policy[]>("/watch-policies");
   const [draft, setDraft] = useState<Watch>();
   const [revision, setRevision] = useState<string>();
   const [error, setError] = useState("");
@@ -53,16 +52,12 @@ export function Watches() {
       workflowId: workflows.data?.[0]?.value.id || "",
       enabled: true,
       policyId: "schedule-cron",
-      settings: { expression: "0 9 * * 1-5", timeZone: "UTC" },
-      inputBindings: {
-        context: {
-          source: "literal",
-          value: "Describe the context for this recurring run.",
-        },
-      },
+      settings: defaultSettings(),
+      input: "",
+      inputBindings: {},
       allowAllTools: false,
       cooldownSeconds: 60,
-      maxRunsPerHour: 10,
+      maxRunsPerHour: 60,
     });
   }
   async function persist(
@@ -71,6 +66,7 @@ export function Watches() {
     action?: WatchActionRequest,
   ) {
     setBusy(true);
+    setError("");
     try {
       await api(`/pipeline-watches/${value.id}`, {
         method: "PUT",
@@ -91,13 +87,49 @@ export function Watches() {
       setBusy(false);
     }
   }
-  const policy = policies.data?.find((item) => item.id === draft?.policyId);
+  async function deleteWatch(item: WatchItem) {
+    if (
+      !window.confirm(
+        `Delete "${item.value.name}"? Future triggers will stop. Existing runs and results will be kept.`,
+      )
+    )
+      return;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/pipeline-watches/${item.value.id}`, {
+        method: "DELETE",
+        body: JSON.stringify({ revision: item.revision }),
+      });
+      setDraft((current) =>
+        current?.id === item.value.id ? undefined : current,
+      );
+      resource.reload();
+    } catch (failure) {
+      setError(errorMessage(failure));
+    } finally {
+      setBusy(false);
+    }
+  }
+  let schedulePreview = "";
+  let scheduleError = "";
+  if (
+    draft &&
+    (draft.settings.compiled || typeof draft.settings.expression === "string")
+  ) {
+    try {
+      const schedule = readWatchSchedule(draft.settings);
+      schedulePreview = `${schedule.description}. Next run: ${new Date(schedule.next).toLocaleString()}.`;
+    } catch (failure) {
+      scheduleError = errorMessage(failure);
+    }
+  }
   return (
     <div className="page">
       <PageHeader
         eyebrow="LET THE PROCESS COME TO YOU"
         title="Watches"
-        description="A schedule or a change. A fresh run, with the same safeguards."
+        description="Your schedule, in your words. A fresh run, with the same safeguards."
       >
         <Link className="button" to="/dashboard">
           Dashboard
@@ -107,13 +139,11 @@ export function Watches() {
           New watch
         </button>
       </PageHeader>
-      <ErrorNotice
-        error={resource.error || policies.error || workflows.error || error}
-      />
+      <ErrorNotice error={resource.error || workflows.error || error} />
       {!resource.data?.length ? (
         <EmptyState
           title="Quietly watching, when you need it"
-          description="Register a policy to run your workflow automatically."
+          description="Set a schedule to run your workflow automatically."
         >
           <button className="button" onClick={create}>
             Create your first watch
@@ -140,7 +170,14 @@ export function Watches() {
                           }
                         : undefined,
                     );
-                    setDraft(item.value);
+                    setDraft({
+                      ...item.value,
+                      policyId: "schedule-cron",
+                      settings:
+                        item.value.policyId === "schedule-cron"
+                          ? item.value.settings
+                          : defaultSettings(),
+                    });
                     setRevision(item.revision);
                   }}
                 >
@@ -163,14 +200,18 @@ export function Watches() {
                     <Play size={15} />
                   )}
                 </button>
+                <button
+                  className="icon-button danger"
+                  aria-label={`Delete ${item.value.name}`}
+                  title="Delete watch"
+                  disabled={busy}
+                  onClick={() => void deleteWatch(item)}
+                >
+                  <Trash2 size={15} />
+                </button>
               </div>
               <p>
-                {
-                  policies.data?.find(
-                    (entry) => entry.id === item.value.policyId,
-                  )?.name
-                }{" "}
-                · {item.value.workflowId}
+                {item.value.workflowId}
                 {item.value.action && ` → ${item.value.action.workflowId}`}
               </p>
               <StatusBadge
@@ -232,7 +273,7 @@ export function Watches() {
             className="modal-panel"
             onSubmit={(event) => {
               event.preventDefault();
-              if (!jsonError)
+              if (!jsonError && !scheduleError)
                 void persist(
                   draft,
                   revision,
@@ -262,7 +303,7 @@ export function Watches() {
               />
             </label>
             <label className="field">
-              Workflow
+              Action or workflow
               <select
                 value={draft.workflowId}
                 onChange={(event) =>
@@ -276,45 +317,103 @@ export function Watches() {
                 ))}
               </select>
             </label>
-            <label className="field">
-              Policy
-              <select
-                value={draft.policyId}
-                onChange={(event) => {
+            <div className="field">
+              <label htmlFor="watch-schedule">Schedule</label>
+              <input
+                id="watch-schedule"
+                disabled={busy}
+                required={typeof draft.settings.expression !== "string"}
+                maxLength={2000}
+                placeholder="Every day at 7am and 7pm, or every 5 min"
+                value={
+                  typeof draft.settings.schedule === "string"
+                    ? draft.settings.schedule
+                    : ""
+                }
+                aria-describedby="watch-schedule-help"
+                aria-invalid={Boolean(scheduleError)}
+                onChange={(event) =>
                   setDraft({
                     ...draft,
-                    policyId: event.target.value,
-                    settings:
-                      event.target.value === "schedule-cron"
-                        ? { expression: "0 9 * * 1-5", timeZone: "UTC" }
-                        : { prUrl: "" },
-                  });
-                }}
-              >
-                {policies.data?.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {policy && (
-              <SchemaForm
-                schema={policy.settingsSchema}
-                value={draft.settings}
-                onChange={(settings: Record<string, Json>) =>
-                  setDraft({ ...draft, settings })
+                    settings: {
+                      schedule: event.target.value,
+                      timeZone:
+                        Intl.DateTimeFormat().resolvedOptions().timeZone,
+                    },
+                  })
                 }
               />
+              <small id="watch-schedule-help">
+                {schedulePreview ||
+                  "AI interprets your schedule once when you save."}{" "}
+                Uses {String(draft.settings.timeZone ?? "UTC")}.
+                {typeof draft.settings.expression === "string" &&
+                  " Your existing schedule is kept unless you enter a new one."}
+              </small>
+              <ErrorNotice error={scheduleError} />
+            </div>
+            {typeof draft.input === "string" ? (
+              <>
+                <label className="field">
+                  Input
+                  <textarea
+                    rows={6}
+                    value={draft.input}
+                    placeholder="Context or instructions for the selected action or workflow"
+                    onChange={(event) =>
+                      setDraft({ ...draft, input: event.target.value })
+                    }
+                  />
+                </label>
+                <p className="muted">
+                  Passed unchanged to the selected action or workflow. No JSON,
+                  mapping, or input-schema validation.
+                </p>
+              </>
+            ) : Object.values(draft.inputBindings).some(
+                (ref) => ref.source !== "literal",
+              ) ? (
+              <JsonEditor
+                label="Trigger input bindings"
+                value={draft.inputBindings}
+                onChange={(value) =>
+                  setDraft(
+                    watchSchema.parse({ ...draft, inputBindings: value }),
+                  )
+                }
+                onError={setJsonError}
+              />
+            ) : (
+              <>
+                <JsonEditor
+                  label="Input"
+                  value={
+                    draft.input !== undefined
+                      ? draft.input
+                      : Object.fromEntries(
+                          Object.entries(draft.inputBindings).flatMap(
+                            ([name, ref]) =>
+                              ref.source === "literal"
+                                ? [[name, ref.value]]
+                                : [],
+                          ),
+                        )
+                  }
+                  onChange={(value) =>
+                    setDraft({
+                      ...draft,
+                      input: jsonValue.parse(value),
+                      inputBindings: {},
+                    })
+                  }
+                  onError={setJsonError}
+                />
+                <p className="muted">
+                  JSON passed unchanged to the selected action or workflow. It
+                  must match its expected input.
+                </p>
+              </>
             )}
-            <JsonEditor
-              label="Workflow input bindings"
-              value={draft.inputBindings}
-              onChange={(value) =>
-                setDraft(watchSchema.parse({ ...draft, inputBindings: value }))
-              }
-              onError={setJsonError}
-            />
             <label className="checkbox-field">
               <input
                 type="checkbox"
@@ -389,7 +488,7 @@ export function Watches() {
                 <p className="muted">
                   {revision
                     ? "This watch uses its saved rules. Create a new watch to change the action or condition."
-                    : "AI converts this sentence into fixed rules once when you save. Matching check inputs carry over to the action. Unsupported conditions will not be saved."}{" "}
+                    : `AI converts this sentence into fixed rules once when you save. ${typeof draft.input === "string" ? "The same text is passed to the action." : "Matching check inputs carry over to the action."} Unsupported conditions will not be saved.`}{" "}
                   Checks wait while either workflow is busy.
                 </p>
               </>
@@ -451,7 +550,7 @@ export function Watches() {
               </span>
               <button
                 className="button primary"
-                disabled={busy || Boolean(jsonError)}
+                disabled={busy || Boolean(jsonError) || Boolean(scheduleError)}
               >
                 {busy ? "Saving watch…" : "Save watch"}
               </button>

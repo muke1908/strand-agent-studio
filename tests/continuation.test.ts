@@ -20,6 +20,268 @@ import { processIdentity } from "../server/process-owner.ts";
 
 type Request = Parameters<AgentBackend["execute"]>[0];
 
+test("re-run waits for active cleanup, uses latest instructions and deduplicates submissions", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const value = workflow();
+  catalog.saveWorkflow(value);
+  const base = fixtureBackend();
+  const entered = Promise.withResolvers<void>();
+  const stopping = Promise.withResolvers<void>();
+  const cleanup = Promise.withResolvers<void>();
+  const calls: Request[] = [];
+  let first = true;
+  const backend: AgentBackend = {
+    ...base,
+    async execute(request, signal) {
+      if (request.purpose === "stage") {
+        calls.push(request);
+        if (first && request.prompt.includes('Execute stage "Report"')) {
+          first = false;
+          entered.resolve();
+          await new Promise<void>((resolve) =>
+            signal.addEventListener("abort", () => resolve(), { once: true }),
+          );
+          stopping.resolve();
+          await cleanup.promise;
+          signal.throwIfAborted();
+        }
+      }
+      return base.execute(request, signal);
+    },
+  };
+  const host = createRunHost(root, catalog, backend);
+  try {
+    const source = host.launch(
+      value.id,
+      { context: "Original task" },
+      "active-source",
+    );
+    await entered.promise;
+    await assert.rejects(
+      host.rerunStage(source.id, "missing", "invalid-stage"),
+      /Stage not found/,
+    );
+    assert.equal(host.store.get(source.id).status, "running");
+    value.stages[1].agents[0].instructions =
+      "Use the corrected report instructions.";
+    catalog.saveWorkflow(value, catalog.workflow(value.id).revision);
+    const firstRequest = host.rerunStage(source.id, "report", "active-rerun");
+    const duplicate = host.rerunStage(source.id, "report", "active-rerun");
+    await stopping.promise;
+    assert.equal(
+      host.store.list().length,
+      1,
+      "No child may start before cleanup",
+    );
+    assert.equal(calls.length, 3);
+    cleanup.resolve();
+    const [child, repeated] = await Promise.all([firstRequest, duplicate]);
+    assert.equal(child.id, repeated.id);
+    const result = await waitForRun(() => host.store.get(child.id));
+    assert.equal(result.status, "completed", result.error);
+    assert.equal(host.store.get(source.id).status, "cancelled");
+    assert.equal(result.units["discover/alpha"].reusedFrom, source.id);
+    assert.deepEqual(result.units["discover/alpha"].attempts, []);
+    assert.equal(calls.length, 4);
+    assert.match(calls.at(-1)!.prompt, /Use the corrected report instructions/);
+    assert.equal(host.store.list().length, 2);
+    assert.equal(
+      (await host.rerunStage(source.id, "report", "active-rerun")).id,
+      child.id,
+    );
+  } finally {
+    cleanup.resolve();
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("re-run accepts queued, cancelled and completed runs", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const value = workflow();
+  catalog.saveWorkflow(value);
+  const host = createRunHost(root, catalog, fixtureBackend());
+  try {
+    const source = host.launch(
+      value.id,
+      { context: "Original task" },
+      "queued-source",
+    );
+    const child = await host.rerunStage(source.id, "discover", "queued-rerun");
+    assert.equal(host.store.get(source.id).status, "cancelled");
+    assert.deepEqual(host.store.get(source.id).units, {});
+    assert.equal(
+      (await waitForRun(() => host.store.get(child.id))).status,
+      "completed",
+    );
+    for (const [id, stageId, requestId] of [
+      [source.id, "discover", "cancelled-rerun"],
+      [child.id, "report", "completed-rerun"],
+    ]) {
+      const next = await host.rerunStage(id, stageId, requestId);
+      const result = await waitForRun(() => host.store.get(next.id));
+      assert.equal(result.status, "completed", result.error);
+      assert.equal(result.units["report/writer"].attempts.length, 1);
+    }
+  } finally {
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("plain-language continuations can restart and skip a blocked loop stage", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const value = definition();
+  value.stages.push({
+    ...value.stages[2],
+    id: "archive",
+    name: "Archive",
+    agents: [{ ...value.stages[2].agents[0], id: "archiver" }],
+  });
+  for (const stage of value.stages) {
+    stage.expectedOutput = "Return an object with a summary.";
+    stage.inputs = {};
+  }
+  value.stages[2].loop = {
+    targetStageId: "report",
+    condition: {
+      agentId: "publisher",
+      pointer: "/needsAnotherPass",
+      operator: "equals",
+      value: true,
+    },
+    maxIterations: 3,
+    feedback: {},
+  };
+  catalog.saveWorkflow(value);
+  const base = fixtureBackend();
+  const calls: Request[] = [];
+  let recover = false;
+  const backend: AgentBackend = {
+    ...base,
+    async execute(request, signal) {
+      if (request.purpose === "stage") {
+        calls.push(request);
+        if (request.prompt.includes('Execute stage "Publish"'))
+          return {
+            summary: recover ? "Reviewed changes" : "Missing optional evidence",
+            status: recover ? "ready" : "blocked",
+            needsAnotherPass: false,
+          };
+      }
+      return base.execute(request, signal);
+    },
+  };
+  const host = createRunHost(root, catalog, backend);
+  try {
+    const source = host.launch(
+      value.id,
+      { context: "Keep the completed workspace changes" },
+      "plain-language-source",
+    );
+    const blocked = await waitForRun(() => host.store.get(source.id));
+    assert.equal(blocked.status, "blocked", blocked.error);
+    assert.equal(blocked.currentStage, "publish");
+    recover = true;
+    for (const skip of [false, true]) {
+      calls.length = 0;
+      const child = host.rerun(
+        source.id,
+        "publish",
+        skip ? "plain-language-skip" : "plain-language-restart",
+        skip
+          ? {
+              reason: "Owner chooses to bypass review",
+              allowPublication: false,
+            }
+          : undefined,
+        !skip,
+      );
+      const result = await waitForRun(() => host.store.get(child.id));
+      assert.equal(result.status, "completed", result.error);
+      assert.equal(calls.length, skip ? 1 : 2);
+      for (const key of ["discover/alpha", "discover/beta", "report/writer"]) {
+        assert.equal(result.units[key].reusedFrom, source.id);
+        assert.deepEqual(result.units[key].attempts, []);
+        assert.deepEqual(result.units[key].output, blocked.units[key].output);
+      }
+      assert.equal(
+        result.units["publish/publisher"].status,
+        skip ? "skipped" : "completed",
+      );
+      assert.deepEqual(
+        calls.at(-1)!.input,
+        result.units["publish/publisher"].output,
+      );
+      assert.equal(host.store.get(source.id).status, "blocked");
+    }
+  } finally {
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("stage restarts execute authored instructions without engine-defined setup policies", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const value = workflow();
+  value.stages[0].agents[0].instructions =
+    "Rebuild the search index for the supplied context.";
+  value.stages[1].agents[0].instructions =
+    "Replace the report using the supplied evidence.";
+  catalog.saveWorkflow(value);
+  const base = fixtureBackend();
+  const calls: Request[] = [];
+  const backend: AgentBackend = {
+    ...base,
+    async execute(request, signal) {
+      if (request.purpose === "stage") calls.push(request);
+      return base.execute(request, signal);
+    },
+  };
+  const host = createRunHost(root, catalog, backend);
+  try {
+    const source = host.launch(
+      "sample",
+      { context: "Original work" },
+      "source",
+    );
+    await waitForRun(() => host.store.get(source.id));
+    for (const stageId of ["discover", "report"]) {
+      calls.length = 0;
+      const restart = host.rerun(source.id, stageId, `restart-${stageId}`);
+      const result = await waitForRun(() => host.store.get(restart.id));
+      assert.equal(result.status, "completed", result.error);
+      assert.equal(calls.length, stageId === "discover" ? 3 : 1);
+      for (const request of calls) {
+        assert.match(
+          request.prompt,
+          /Execute the restarted stages according to their own instructions/,
+        );
+        assert.doesNotMatch(
+          request.prompt,
+          /workspace|master refresh|ticket|branch creation|fresh setup|executionId/i,
+        );
+        assert(request.directory.startsWith(host.store.directory(restart.id)));
+      }
+      assert.match(
+        calls.at(-1)!.prompt,
+        /Replace the report using the supplied evidence/,
+      );
+      if (stageId === "discover")
+        assert.match(calls[0].prompt, /Rebuild the search index/);
+      else
+        assert.match(calls[0].prompt, /Earlier stages are reused, not rerun/);
+    }
+  } finally {
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
 test("owner skips preserve history, never execute skipped agents, and survive resume and later reruns", async () => {
   const root = temporaryRoot();
   const catalog = createCatalog(root);
@@ -123,7 +385,7 @@ test("owner skips preserve history, never execute skipped agents, and survive re
     assert.match(publish.prompt, /Skipped is not passed/);
     assert.match(publish.prompt, /permits downstream commit\/push\/PR/);
     assert.match(publish.prompt, /real defects/i);
-    assert.match(publish.prompt, /Do not repeat workspace resets/);
+    assert.match(publish.prompt, /Earlier stages are reused, not rerun/);
     assert.match(JSON.stringify(publish.input), /skipped by owner/);
     assert.match(calls[0].prompt, /Explicit owner-authorized stage skips/);
     host.store.verify(child.id);
@@ -346,11 +608,7 @@ test("stage reruns reuse only verified prefix checkpoints and preserve pinned co
     assert.equal(report.model, "pinned-model");
     assert.deepEqual(report.allowedFolders, [fs.realpathSync(folder)]);
     assert.equal(report.allowAllTools, true);
-    assert.match(report.prompt, /Do not repeat workspace resets/);
-    assert.match(
-      report.prompt,
-      /verify the inherited workspace, task\/ticket, branch, base revision/,
-    );
+    assert.match(report.prompt, /Earlier stages are reused, not rerun/);
     assert.match(report.prompt, /Original blocked output/);
     assert.match(report.prompt, /Historical attempt of this agent/);
     for (const agent of ["alpha", "beta"]) {
@@ -562,18 +820,11 @@ test("queued continuation recovery and resume never execute inherited agents or 
   }
 });
 
-test("stage admission rejects active sources, incomplete prefixes, orphan processes and competing workspace execution", async () => {
+test("stage admission rejects active sources, incomplete prefixes and orphan processes", async () => {
   const root = temporaryRoot();
   const catalog = createCatalog(root);
   const value = definition();
-  value.stages[0].agents[0].allowedFolders = [root];
   catalog.saveWorkflow(value);
-  const shared = workflow("shared");
-  const nested = path.join(root, "nested");
-  fs.mkdirSync(nested);
-  shared.stages[0].agents[0].allowedFolders = [nested];
-  catalog.saveWorkflow(shared);
-  catalog.saveWorkflow(workflow("unrelated"));
   const base = fixtureBackend();
   const backend: AgentBackend = {
     ...base,
@@ -625,31 +876,8 @@ test("stage admission rejects active sources, incomplete prefixes, orphan proces
       /Cannot restart.*still active/,
     );
     fs.unlinkSync(wrapper);
-    host.rerun(source.id, "report", "competing-child");
-    assert.throws(
-      () => host.rerun(source.id, "report", "competing-sibling"),
-      /using this workflow or shared folders/,
-    );
-    assert.throws(
-      () => host.resume(source.id),
-      /using this workflow or shared folders/,
-    );
-    assert.throws(
-      () =>
-        host.launch("sample", { context: "Conflicting" }, "competing-launch"),
-      /using this workflow or shared folders/,
-    );
-    assert.throws(
-      () =>
-        host.launch(
-          "shared",
-          { context: "Nested shared workspace" },
-          "shared-workspace",
-        ),
-      /using this workflow or shared folders/,
-    );
     assert.doesNotThrow(() =>
-      host.launch("unrelated", { context: "Separate workflow" }, "separate"),
+      host.rerun(source.id, "report", "retry-after-orphan"),
     );
   } finally {
     await host.close();

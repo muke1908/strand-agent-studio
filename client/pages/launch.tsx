@@ -5,6 +5,8 @@ import type { Json, Run, Saved, Workflow } from "../../shared/contracts.ts";
 import { api, errorMessage, useResource } from "../api.ts";
 import { ErrorNotice, Loading, PageHeader } from "../components.tsx";
 import { JsonInput, SchemaForm, supportsForm } from "../forms/schema-form.tsx";
+import { validateJson } from "../../shared/json-schema.ts";
+import { isAction, workflowPath } from "../../shared/workflow-kind.ts";
 
 export function Launch() {
   const { id } = useParams();
@@ -28,6 +30,9 @@ export function Launch() {
       const submittedInput = supportsForm(resource.data.value.inputSchema)
         ? input
         : raw;
+      if (submittedInput === undefined)
+        throw new Error("Enter valid JSON input.");
+      validateJson(resource.data.value.inputSchema, submittedInput);
       const digest = JSON.stringify({
         id,
         input: submittedInput,
@@ -59,9 +64,9 @@ export function Launch() {
     );
   return (
     <div className="page narrow">
-      <Link className="back-link" to={`/pipelines/${id}`}>
+      <Link className="back-link" to={workflowPath(resource.data.value)}>
         <ArrowLeft size={14} />
-        Back to workflow
+        Back to {isAction(resource.data.value) ? "action" : "workflow"}
       </Link>
       <PageHeader
         eyebrow="START A RUN"
@@ -77,7 +82,10 @@ export function Launch() {
           <SchemaForm
             schema={resource.data.value.inputSchema}
             value={input}
-            onChange={setInput}
+            onChange={(value) => {
+              setInput(value);
+              setError("");
+            }}
           />
         ) : (
           <>
@@ -110,7 +118,10 @@ export function Launch() {
         </p>
         <div className="form-footer">
           <span>
-            {resource.data.value.stages.length} stages · pinned instructions
+            {isAction(resource.data.value)
+              ? "Single step"
+              : `${resource.data.value.stages.length} stages`}{" "}
+            · pinned instructions
           </span>
           <button
             className="button primary"
@@ -127,7 +138,9 @@ export function Launch() {
                 : "Add to queue"
               : busy
                 ? "Starting…"
-                : "Run workflow"}
+                : isAction(resource.data.value)
+                  ? "Run action"
+                  : "Run workflow"}
           </button>
         </div>
       </form>

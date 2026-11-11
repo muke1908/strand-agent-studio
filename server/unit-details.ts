@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { jsonValue, loopContextSchema } from "../shared/contracts.ts";
 import type { Json, UnitDetails } from "../shared/contracts.ts";
-import { resolveReference } from "../shared/bindings.ts";
+import { resolveStageInput } from "../shared/bindings.ts";
 import { outputArtifactName } from "./run-checkpoint.ts";
 import type { RunStore } from "./run-store.ts";
 import { agentSkills, stageSkipPolicy } from "./prompts.ts";
@@ -37,7 +37,7 @@ export function unitDetails(
     return {
       unit,
       kind: "contract",
-      input: jsonValue.parse(stage.outputSchema),
+      input: stage.expectedOutput ?? jsonValue.parse(stage.outputSchema),
       ...(output === undefined ? {} : { output: jsonValue.parse(output) }),
     };
   }
@@ -63,9 +63,9 @@ export function unitDetails(
       unit,
       kind: "agent",
       input: {
-        stageInstructions: stage.instructions,
         agentInstructions: agent.instructions,
         allowedFolders: agent.allowedFolders ?? snapshot.allowedFolders ?? [],
+        ...(snapshot.paths ? { paths: snapshot.paths } : {}),
         skills: agentSkills(stage, agent, snapshot.skills),
         workflowInput: snapshot.input,
         ...savedInput,
@@ -89,11 +89,11 @@ export function unitDetails(
       handoffs[`${previous.id}/${agent.id}`] = saved.output;
     }
   }
-  const stageInput = Object.fromEntries(
-    Object.entries(stage.inputs).map(([name, ref]) => [
-      name,
-      resolveReference(ref, snapshot.input, handoffs),
-    ]),
+  const stageInput = resolveStageInput(
+    snapshot.workflow,
+    stage,
+    snapshot.input,
+    handoffs,
   );
   const saved = store.readArtifactIfPresent(
     id,
@@ -103,9 +103,9 @@ export function unitDetails(
     unit,
     kind: "agent",
     input: {
-      stageInstructions: stage.instructions,
       agentInstructions: agent.instructions,
       allowedFolders: agent.allowedFolders ?? snapshot.allowedFolders ?? [],
+      ...(snapshot.paths ? { paths: snapshot.paths } : {}),
       skills: agentSkills(stage, agent, snapshot.skills),
       workflowInput: snapshot.input,
       stageInput,

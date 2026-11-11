@@ -151,6 +151,91 @@ test("a blocked run releases the serial lane for the next workflow", async () =>
   }
 });
 
+test("shared folders do not override queue participation for continuations, launches or resumes", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root, { paths: { SHARED: root } });
+  const continuationDefinition = serialWorkflow("continuation");
+  const resumedDefinition = serialWorkflow("resumed");
+  const parallelDefinition = serialWorkflow("parallel");
+  delete parallelDefinition.queued;
+  catalog.saveWorkflow(continuationDefinition);
+  catalog.saveWorkflow(resumedDefinition);
+  catalog.saveWorkflow(parallelDefinition);
+  const { backend, gates, started } = controlledBackend([
+    "continuation",
+    "queued",
+    "parallel",
+    "resumed",
+  ]);
+  const host = createRunHost(root, catalog, backend);
+  try {
+    const source = host.launch(
+      "continuation",
+      { context: "continuation" },
+      "source",
+    );
+    const continuationGate = gates.get("continuation")!;
+    await continuationGate.started.promise;
+    continuationGate.release.reject(new Error("Retry from this stage"));
+    assert.equal(
+      (await waitForRun(() => host.store.get(source.id))).status,
+      "blocked",
+    );
+    continuationGate.started = Promise.withResolvers<void>();
+    continuationGate.release = Promise.withResolvers<void>();
+    started.length = 0;
+
+    const continuation = host.rerun(source.id, "discover", "continuation");
+    await continuationGate.started.promise;
+    const queued = host.launch("continuation", { context: "queued" }, "queued");
+    const resumedSource = host.store.create(
+      resumedDefinition,
+      [],
+      { context: "resumed" },
+      "resume-source",
+      backend.id,
+      undefined,
+      false,
+      { paths: catalog.config.paths, allowedFolders: [root] },
+    );
+    resumedSource.status = "blocked";
+    host.store.save(resumedSource);
+    host.resume(resumedSource.id);
+    const parallel = host.launch(
+      "parallel",
+      { context: "parallel" },
+      "parallel",
+    );
+    await gates.get("parallel")!.started.promise;
+    assert.deepEqual(started, ["continuation", "parallel"]);
+    assert.equal(host.store.get(queued.id).status, "queued");
+    assert.equal(host.store.get(resumedSource.id).status, "queued");
+
+    continuationGate.release.resolve();
+    await gates.get("queued")!.started.promise;
+    assert.equal(host.store.get(resumedSource.id).status, "queued");
+    gates.get("queued")!.release.resolve();
+    await gates.get("resumed")!.started.promise;
+    assert.deepEqual(started, [
+      "continuation",
+      "parallel",
+      "queued",
+      "resumed",
+    ]);
+    gates.get("resumed")!.release.resolve();
+    gates.get("parallel")!.release.resolve();
+    for (const run of [continuation, queued, resumedSource, parallel])
+      assert.equal(
+        (await waitForRun(() => host.store.get(run.id))).status,
+        "completed",
+      );
+  } finally {
+    for (const gate of gates.values()) gate.release.resolve();
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
 test("restart restores durable FIFO ordering and resume and rerun retain pinned queue participation", async () => {
   const root = temporaryRoot();
   const catalog = createCatalog(root);

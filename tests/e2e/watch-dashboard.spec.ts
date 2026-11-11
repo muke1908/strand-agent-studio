@@ -40,6 +40,106 @@ function watchResult(
   };
 }
 
+test("LLM-driven watch schedules save multiple times and intervals in the user's timezone", async ({
+  browser,
+}) => {
+  const context = await browser.newContext({ timezoneId: "Europe/Berlin" });
+  const page = await context.newPage();
+  const name = `Natural schedule ${crypto.randomUUID()}`;
+  let watchId = "";
+  try {
+    await page.goto("/watches");
+    await page.getByRole("button", { name: "New watch", exact: true }).click();
+    await expect(page.getByLabel("Policy", { exact: true })).toHaveCount(0);
+    await expect(page.getByLabel("Time zone", { exact: true })).toHaveCount(0);
+    await expect(page.getByLabel("Cron expression")).toHaveCount(0);
+    await page.getByLabel("Watch name").fill(name);
+    const schedule = page.getByLabel("Schedule", { exact: true });
+    await schedule.fill("whenever");
+    await expect(
+      page.getByRole("button", { name: "Save watch" }),
+    ).toBeEnabled();
+    const unsupported = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PUT" &&
+        response.url().includes("/api/pipeline-watches/"),
+    );
+    await page.getByRole("button", { name: "Save watch" }).click();
+    expect((await unsupported).status()).toBe(400);
+    await expect(page.getByRole("alert").last()).toContainText(
+      "Describe a specific time or interval",
+    );
+    await expect(schedule).toHaveValue("whenever");
+    await schedule.fill("Every day at 7am and 7 pm");
+    await expect(
+      page.getByText("AI interprets your schedule once when you save.", {
+        exact: false,
+      }),
+    ).toBeVisible();
+    const saved = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PUT" &&
+        response.url().includes("/api/pipeline-watches/"),
+    );
+    await page.getByRole("button", { name: "Save watch" }).click();
+    const response = await saved;
+    expect(response.ok()).toBeTruthy();
+    const request = response.request().postDataJSON();
+    watchId = request.value.id;
+    expect(request.value.policyId).toBe("schedule-cron");
+    expect(request.value.settings).toEqual({
+      schedule: "Every day at 7am and 7 pm",
+      timeZone: "Europe/Berlin",
+    });
+    const result = await response.json();
+    expect(result.value.settings.compiled.expressions).toEqual([
+      "0 7,19 * * *",
+    ]);
+    await expect(
+      page
+        .getByRole("region", { name })
+        .getByText("Schedule: Every day at 07:00 and 19:00 (Europe/Berlin)"),
+    ).toBeVisible();
+    await page.reload();
+    await page.getByRole("button", { name, exact: true }).click();
+    await expect(schedule).toHaveValue("Every day at 7am and 7 pm");
+    await expect(
+      page.getByText("Every day at 07:00 and 19:00. Next run:", {
+        exact: false,
+      }),
+    ).toBeVisible();
+    await schedule.fill("every 5 min");
+    await page.getByRole("button", { name: "Save watch" }).click();
+    await expect(
+      page
+        .getByRole("region", { name })
+        .getByText("Schedule: Every 5 minutes (Europe/Berlin)"),
+    ).toBeVisible();
+    const invalid = await page.request.put(`/api/pipeline-watches/${watchId}`, {
+      data: {
+        value: {
+          ...request.value,
+          settings: { schedule: "sometimes", timeZone: "Europe/Berlin" },
+        },
+      },
+    });
+    expect(invalid.status()).toBe(400);
+  } finally {
+    if (watchId) {
+      const watches = await page.request.get("/api/pipeline-watches");
+      const items: Saved<{ id: string }>[] = await watches.json();
+      const item = items.find(({ value }) => value.id === watchId);
+      if (item)
+        await expect(
+          await page.request.delete(`/api/pipeline-watches/${watchId}`, {
+            data: { revision: item.revision },
+          }),
+        ).toBeOK();
+    }
+    await context.close();
+  }
+});
+
 test("dashboard retains previous output while polling running, failed and recovered results", async ({
   page,
 }) => {
@@ -229,11 +329,11 @@ test("configure an action using a workflow dropdown and a plain-language conditi
   await page.getByRole("button", { name: "New watch", exact: true }).click();
   await page.getByLabel("Watch name").fill(`Conditional work ${suffix}`);
   await page
-    .getByRole("combobox", { name: "Workflow", exact: true })
+    .getByRole("combobox", { name: "Action or workflow", exact: true })
     .selectOption(`cycle-ui-check-${suffix}`);
   await page
-    .getByLabel("Workflow input bindings")
-    .fill('{"context":{"source":"literal","value":"Check work"}}');
+    .getByRole("textbox", { name: "Input", exact: true })
+    .fill("Check work");
   await page
     .getByRole("checkbox", {
       name: "Run an action workflow when the check qualifies",
@@ -245,13 +345,12 @@ test("configure an action using a workflow dropdown and a plain-language conditi
     .selectOption(`cycle-ui-action-${suffix}`);
   const condition = "Run when the check produces a nonempty summary.";
   await page.getByLabel("When to run", { exact: true }).fill(condition);
-  await page.getByLabel("Workflow input bindings").fill("{");
-  await expect(page.getByRole("button", { name: "Save watch" })).toBeDisabled();
+  await page.getByRole("textbox", { name: "Input", exact: true }).fill("{");
+  await expect(page.getByRole("button", { name: "Save watch" })).toBeEnabled();
   await page.getByLabel("When to run", { exact: true }).fill(`${condition} `);
-  await expect(page.getByRole("button", { name: "Save watch" })).toBeDisabled();
-  await page
-    .getByLabel("Workflow input bindings")
-    .fill('{"context":{"source":"literal","value":"Check updated work"}}');
+  await expect(page.getByRole("button", { name: "Save watch" })).toBeEnabled();
+  const input = "  Check updated work.\n{not JSON}\nKeep this exact text.  ";
+  await page.getByRole("textbox", { name: "Input", exact: true }).fill(input);
   await expect(page.getByRole("button", { name: "Save watch" })).toBeEnabled();
   await page.getByRole("button", { name: "Save watch" }).click();
   await expect(
@@ -272,6 +371,9 @@ test("configure an action using a workflow dropdown and a plain-language conditi
   await expect(page.getByLabel("When to run", { exact: true })).toHaveValue(
     condition,
   );
+  await expect(
+    page.getByRole("textbox", { name: "Input", exact: true }),
+  ).toHaveValue(input);
   await expect(page.getByLabel("When to run", { exact: true })).toHaveAttribute(
     "readonly",
     "",

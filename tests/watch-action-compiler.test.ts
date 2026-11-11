@@ -42,6 +42,7 @@ function setup() {
   check.stages = [check.stages[0]];
   check.stages[0].agents = [check.stages[0].agents[0]];
   check.stages[0].inputs = {};
+  check.stages[0].expectedOutput = "The PR's comment counts and readiness.";
   check.stages[0].outputSchema = {
     type: "object",
     properties: {
@@ -64,8 +65,10 @@ function setup() {
   action.stages = [action.stages[0]];
   action.stages[0].agents = [action.stages[0].agents[0]];
   action.stages[0].inputs = {};
+  action.stages[0].expectedOutput = "A summary of the action.";
   catalog.saveWorkflow(action);
   const calls: AgentRequest[] = [];
+  const stageInputs: Json[] = [];
   const control: {
     output: Json;
     before?: (signal: AbortSignal) => Promise<void>;
@@ -78,6 +81,7 @@ function setup() {
   const backend: AgentBackend = {
     ...base,
     async execute(request, signal) {
+      if (request.purpose === "stage") stageInputs.push(request.input);
       if (request.purpose === "watch-condition") {
         calls.push(request);
         await control.before?.(signal);
@@ -114,6 +118,7 @@ function setup() {
     backend,
     host,
     calls,
+    stageInputs,
     control,
     inputs,
     compile,
@@ -355,7 +360,7 @@ test("API compiles once at registration; Pause and scheduled cycles reuse the sa
       enabled: true,
       policyId: "change",
       settings: {},
-      inputBindings: s.inputs,
+      input: "  Check https://example.test/pr/1\nDo not change anything yet.  ",
       cooldownSeconds: 0,
       maxRunsPerHour: 10,
       action: { workflowId: "action", whenToRun: sentence },
@@ -367,6 +372,12 @@ test("API compiles once at registration; Pause and scheduled cycles reuse the sa
       JSON.stringify(await response.clone().json()),
     );
     const saved = await response.json();
+    assert.deepEqual(saved.value.input, draft.input);
+    assert.deepEqual(saved.value.action.input, {
+      source: "input",
+      pointer: "",
+    });
+    assert.deepEqual(saved.value.action.inputBindings, {});
     assert.equal(saved.value.action.whenToRun, sentence);
     assert.deepEqual(saved.value.action.conditions, plan().conditions);
     const repeated = await put(draft);
@@ -394,6 +405,9 @@ test("API compiles once at registration; Pause and scheduled cycles reuse the sa
     const acting = await watcher.evaluate(value);
     assert.equal(acting.phase, "acting");
     await waitForRun(() => s.host.store.get(acting.activeRunId!));
+    assert.equal(s.host.store.snapshot(state.activeRunId!).input, draft.input);
+    assert.equal(s.host.store.snapshot(acting.activeRunId!).input, draft.input);
+    assert.deepEqual(s.stageInputs, [draft.input, draft.input]);
     const completed = await watcher.evaluate(value);
     assert.equal(completed.decisions[0].outcome, "completed");
     s.control.lastCommentPostedAt = null;

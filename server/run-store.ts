@@ -53,6 +53,7 @@ const unitSchema = z.object({
 });
 const runSchema: z.ZodType<Run> = z.object({
   id: identifier,
+  historyDeleted: z.boolean().optional(),
   workflowId: identifier,
   workflowName: z.string(),
   status,
@@ -100,6 +101,7 @@ const snapshotSchema = z.object({
   allowAllTools: z.boolean().optional(),
   // Preserve historical run-wide grants during recovery.
   allowedFolders: allowedFoldersSchema.optional(),
+  paths: z.record(z.string(), z.string()).optional(),
   stageSkips: z.array(stageSkipSchema).optional(),
   continuation: continuationSchema
     .extend({
@@ -153,6 +155,7 @@ export function createRunStore(root: string) {
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
   function enqueue(run: Run): void {
+    delete run.historyDeleted;
     run.queueOrder =
       list().reduce((order, item) => Math.max(order, item.queueOrder ?? 0), 0) +
       1;
@@ -209,6 +212,12 @@ export function createRunStore(root: string) {
       return undefined;
     },
     list,
+    history: () => list().filter((run) => !run.historyDeleted),
+    removeFromHistory(id: string): void {
+      const run = get(id);
+      run.historyDeleted = true;
+      writeJson(path.join(directory(id), "state.json"), run);
+    },
     enqueue,
     create(
       workflow: Workflow,
@@ -220,7 +229,7 @@ export function createRunStore(root: string) {
       allowAllTools = false,
       recovery?: Pick<
         Snapshot,
-        "continuation" | "allowedFolders" | "stageSkips"
+        "continuation" | "allowedFolders" | "stageSkips" | "paths"
       >,
     ): Run {
       const id = `run-${randomUUID()}`;

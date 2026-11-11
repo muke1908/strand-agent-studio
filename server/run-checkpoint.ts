@@ -7,7 +7,7 @@ import {
   schema,
 } from "../shared/contracts.ts";
 import type { Json } from "../shared/contracts.ts";
-import { resolveReference } from "../shared/bindings.ts";
+import { resolveStageInput } from "../shared/bindings.ts";
 import { digest } from "./files.ts";
 import type { RunStore } from "./run-store.ts";
 import { assertStageNotBlocked } from "./validation.ts";
@@ -77,11 +77,12 @@ export function checkpointPrefix(
         { status: 409 },
       );
     const contract = schema.parse(raw);
-    const stageInput = Object.fromEntries(
-      Object.entries(stage.inputs).map(([name, ref]) => [
-        name,
-        resolveReference(ref, snapshot.input, handoffs, undefined, loopContext),
-      ]),
+    const stageInput = resolveStageInput(
+      snapshot.workflow,
+      stage,
+      snapshot.input,
+      handoffs,
+      loopContext,
     );
     const inputDigest = digest({
       input: snapshot.input,

@@ -13,7 +13,469 @@ import { fixtureBackend } from "../server/fixture-backend.ts";
 import { executeRun } from "../server/run-engine.ts";
 import { runAssets } from "../server/run-assets.ts";
 import { temporaryRoot, workflow, waitForRun } from "./helpers.ts";
-import type { QueueState, WatchDashboardItem } from "../shared/contracts.ts";
+import type {
+  QueueState,
+  RunSummary,
+  WatchDashboardItem,
+} from "../shared/contracts.ts";
+import { watchSchema } from "../shared/contracts.ts";
+import { writeJson } from "../server/files.ts";
+import { createRunStore } from "../server/run-store.ts";
+
+test("plain-language inputs compile on save, preserve legacy schemas, and reject failed compilation", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const base = fixtureBackend();
+  const compiled = {
+    type: "object",
+    required: ["prUrl"],
+    properties: { prUrl: { type: "string", title: "PR URL", format: "uri" } },
+    additionalProperties: false,
+  };
+  let compileCount = 0;
+  let invalid = false;
+  const backend: AgentBackend = {
+    ...base,
+    async execute(request, signal) {
+      if (
+        request.purpose === "schema" &&
+        request.prompt.includes("## Expected input")
+      ) {
+        compileCount++;
+        assert.equal(request.allowAllTools, false);
+        assert.deepEqual(request.allowedFolders, []);
+        return invalid
+          ? { status: "blocked", error: "Cannot compile" }
+          : compiled;
+      }
+      return base.execute(request, signal);
+    },
+  };
+  const host = createRunHost(root, catalog, backend);
+  const watcher = createWatcher(root, catalog, host, []);
+  const server = createApp(catalog, host, watcher, backend).listen(
+    0,
+    "127.0.0.1",
+  );
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const origin = `http://127.0.0.1:${address.port}`;
+  const put = (value: ReturnType<typeof workflow>, revision?: string) =>
+    fetch(`${origin}/api/pipelines/${value.id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ value, revision }),
+    });
+  try {
+    const definition = workflow("plain-input");
+    definition.stages = [definition.stages[0]];
+    definition.stages[0].inputs = {};
+    const legacy = await put(definition);
+    assert.equal(legacy.status, 200);
+    const original = catalog.workflow(definition.id);
+    assert.deepEqual(original.value.inputSchema, definition.inputSchema);
+    assert.equal(compileCount, 0);
+
+    definition.expectedInput = "A required PR URL.";
+    const response = await put(definition, original.revision);
+    assert.equal(response.status, 200);
+    const saved = catalog.workflow(definition.id);
+    assert.equal(saved.value.expectedInput, definition.expectedInput);
+    assert.deepEqual(saved.value.inputSchema, compiled);
+    assert.equal(compileCount, 1);
+    const launch = (input: unknown) =>
+      fetch(`${origin}/api/pipelines/${definition.id}/runs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ input, requestId: "compiled-input-launch" }),
+      });
+    assert.equal(
+      (await launch({ context: "Old input is invalid" })).status,
+      400,
+    );
+    const launched = await launch({ prUrl: "https://example.com/pr/1" });
+    assert.equal(launched.status, 202);
+    const run = await launched.json();
+    assert.equal(
+      (await waitForRun(() => host.store.get(run.id))).status,
+      "completed",
+    );
+
+    assert.equal(
+      (await put({ ...saved.value, name: "Renamed" }, saved.revision)).status,
+      200,
+    );
+    assert.equal(
+      compileCount,
+      1,
+      "Unchanged descriptions keep their compiled schema",
+    );
+    const renamed = catalog.workflow(definition.id);
+    invalid = true;
+    const failure = await put(
+      { ...renamed.value, expectedInput: "An unsupported input." },
+      renamed.revision,
+    );
+    assert.equal(failure.status, 400);
+    assert.deepEqual(catalog.workflow(definition.id), renamed);
+    assert.equal(compileCount, 2);
+
+    const cleared = await put(
+      { ...renamed.value, expectedInput: "" },
+      renamed.revision,
+    );
+    assert.equal(cleared.status, 200);
+    assert.deepEqual(catalog.workflow(definition.id).value.inputSchema, {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    });
+    assert.equal(
+      compileCount,
+      2,
+      "Empty input descriptions need no model call",
+    );
+  } finally {
+    await host.close();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("run kinds use pinned definitions and group deletion preserves the other kind", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const backend = fixtureBackend();
+  const host = createRunHost(root, catalog, backend);
+  const watcher = createWatcher(root, catalog, host, []);
+  const server = createApp(catalog, host, watcher, backend).listen(
+    0,
+    "127.0.0.1",
+  );
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const origin = `http://127.0.0.1:${address.port}/api`;
+  const create = (definition: ReturnType<typeof workflow>) => {
+    const run = host.store.create(
+      definition,
+      [],
+      { context: "Pinned run classification" },
+      `kind-${host.store.list().length}`,
+      backend.id,
+    );
+    run.status = "completed";
+    host.store.save(run);
+    return run;
+  };
+  try {
+    const definition = workflow();
+    catalog.saveWorkflow(definition);
+    const process = create(definition);
+    const action = workflow();
+    action.stages.length = 1;
+    const single = create(action);
+    const pinned = host.store.snapshot(single.id);
+    const loop = workflow("deleted-loop");
+    loop.stages.length = 1;
+    loop.stages[0].loop = {
+      targetStageId: loop.stages[0].id,
+      condition: {
+        agentId: loop.stages[0].agents[0].id,
+        pointer: "/retry",
+        operator: "equals",
+        value: true,
+      },
+      maxIterations: 2,
+      feedback: {},
+    };
+    const repeated = create(loop);
+    const historyResponse = await fetch(`${origin}/pipeline-runs`);
+    assert.equal(historyResponse.status, 200);
+    const history: RunSummary[] = await historyResponse.json();
+    const kinds = new Map(history.map((run) => [run.id, run.kind]));
+    assert.equal(kinds.get(process.id), "workflow");
+    assert.equal(kinds.get(single.id), "action");
+    assert.equal(kinds.get(repeated.id), "workflow");
+    for (const run of [process, single, repeated]) {
+      const response = await fetch(`${origin}/pipeline-runs/${run.id}`);
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).kind, kinds.get(run.id));
+    }
+    const remove = (kind: string) =>
+      fetch(`${origin}/pipelines/${definition.id}/run-history?kind=${kind}`, {
+        method: "DELETE",
+      });
+    assert.equal((await remove("unknown")).status, 400);
+    const deleted = await remove("action");
+    assert.equal(deleted.status, 200);
+    assert.deepEqual(await deleted.json(), { deleted: 1 });
+    assert.deepEqual(
+      host.store
+        .history()
+        .map((run) => run.id)
+        .sort(),
+      [process.id, repeated.id].sort(),
+    );
+    assert.deepEqual(host.store.snapshot(single.id), pinned);
+    const details = await fetch(`${origin}/pipeline-runs/${single.id}`);
+    assert.equal(details.status, 200);
+    assert.equal((await details.json()).kind, "action");
+  } finally {
+    await host.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("run history deletion persists without breaking run records, watches or submission identities", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const definition = workflow();
+  catalog.saveWorkflow(definition);
+  catalog.saveWatch(
+    watchSchema.parse({
+      id: "daily",
+      name: "Daily sample",
+      workflowId: definition.id,
+      enabled: true,
+      policyId: "schedule-cron",
+      settings: { expression: "0 9 * * *", timeZone: "UTC" },
+      inputBindings: {
+        context: { source: "literal", value: "History" },
+      },
+    }),
+  );
+  const backend = fixtureBackend();
+  const host = createRunHost(root, catalog, backend);
+  const watcher = createWatcher(root, catalog, host, []);
+  const server = createApp(catalog, host, watcher, backend).listen(
+    0,
+    "127.0.0.1",
+  );
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const origin = `http://127.0.0.1:${address.port}`;
+  const request = (url: string, method = "GET") =>
+    fetch(`${origin}/api${url}`, { method });
+  const create = (
+    id: string,
+    status:
+      | "completed"
+      | "blocked"
+      | "cancelled"
+      | "queued"
+      | "running" = "completed",
+  ) => {
+    const run = host.store.create(
+      workflow(id),
+      [],
+      { context: "History" },
+      `history-${host.store.list().length}`,
+      backend.id,
+    );
+    run.status = status;
+    run.queued = true;
+    host.store.save(run);
+    return run;
+  };
+  try {
+    const runs = Array.from({ length: 13 }, () => create("sample"));
+    const kept = create("other");
+    const deleted = runs[0];
+    const snapshot = host.store.snapshot(deleted.id);
+    writeJson(path.join(root, "watch-state", "daily.json"), {
+      id: "daily",
+      nextCheck: new Date().toISOString(),
+      decisions: [
+        {
+          eventId: "watched",
+          resourceId: "sample",
+          reason: "History",
+          input: { context: "History" },
+          observedAt: new Date().toISOString(),
+          status: "launched",
+          runId: deleted.id,
+        },
+      ],
+    });
+    assert.equal(
+      (await request(`/pipeline-runs/${deleted.id}`, "DELETE")).status,
+      200,
+    );
+    assert.equal((await request("/pipeline-runs")).status, 200);
+    assert(!host.store.history().some((run) => run.id === deleted.id));
+    assert(
+      !createRunStore(root)
+        .history()
+        .some((run) => run.id === deleted.id),
+    );
+    assert.equal(host.store.get(deleted.id).updatedAt, deleted.updatedAt);
+    assert.equal((await request(`/pipeline-runs/${deleted.id}`)).status, 200);
+    assert.deepEqual(host.store.snapshot(deleted.id), snapshot);
+    host.store.verify(deleted.id);
+    const dashboard = await request("/watch-dashboard");
+    assert.equal(dashboard.status, 200);
+    assert.equal((await dashboard.json())[0].latestRun.id, deleted.id);
+    assert.equal(
+      host.launch("sample", { context: "History" }, deleted.requestId).id,
+      deleted.id,
+    );
+    const queue = await request("/queue");
+    assert(
+      !(await queue.json()).runs.some(
+        (run: { id: string }) => run.id === deleted.id,
+      ),
+    );
+    assert.equal(
+      (await request("/pipeline-runs/missing", "DELETE")).status,
+      404,
+    );
+
+    const queued = create("sample", "queued");
+    const running = create("sample", "running");
+    for (const run of [queued, running])
+      assert.equal(
+        (await request(`/pipeline-runs/${run.id}`, "DELETE")).status,
+        409,
+      );
+    const group = "/pipelines/sample/run-history";
+    assert.equal((await request(group, "DELETE")).status, 409);
+    assert.equal(
+      host.store.history().filter((run) => run.workflowId === "sample").length,
+      14,
+    );
+    for (const run of [queued, running]) {
+      run.status = run.id === queued.id ? "cancelled" : "blocked";
+      host.store.save(run);
+    }
+    const response = await request(group, "DELETE");
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { deleted: 14 });
+    assert.deepEqual(
+      (await (await request("/pipeline-runs")).json()).map(
+        (run: { id: string }) => run.id,
+      ),
+      [kept.id],
+    );
+    assert.deepEqual(
+      createRunStore(root)
+        .history()
+        .map((run) => run.id),
+      [kept.id],
+    );
+    assert.equal(catalog.workflow("sample").value.id, "sample");
+    assert.deepEqual(await (await request(group, "DELETE")).json(), {
+      deleted: 0,
+    });
+    const fresh = create("sample");
+    assert(host.store.history().some((run) => run.id === fresh.id));
+    const restored = host.store.get(queued.id);
+    host.store.enqueue(restored);
+    assert(host.store.history().some((run) => run.id === queued.id));
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("watch deletion API checks revisions, removes scheduling state and preserves runs", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  catalog.saveWorkflow(workflow());
+  const saved = catalog.saveWatch(
+    watchSchema.parse({
+      id: "daily",
+      name: "Daily sample",
+      workflowId: "sample",
+      enabled: true,
+      policyId: "schedule-cron",
+      settings: { expression: "0 9 * * *", timeZone: "UTC" },
+      inputBindings: {
+        context: { source: "literal", value: "Scheduled context" },
+      },
+    }),
+  );
+  const backend = fixtureBackend();
+  const host = createRunHost(root, catalog, backend);
+  const watcher = createWatcher(root, catalog, host, []);
+  const server = createApp(catalog, host, watcher, backend).listen(
+    0,
+    "127.0.0.1",
+  );
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const origin = `http://127.0.0.1:${address.port}`;
+  const stateFile = path.join(root, "watch-state", "daily.json");
+  const state = {
+    id: "daily",
+    nextCheck: new Date().toISOString(),
+    decisions: [],
+  };
+  writeJson(stateFile, state);
+  const remove = (body: unknown) =>
+    fetch(`${origin}/api/pipeline-watches/daily`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  try {
+    for (const body of [
+      {},
+      { revision: "" },
+      { revision: saved.revision, force: true },
+    ])
+      assert.equal((await remove(body)).status, 400);
+    const stale = await remove({ revision: "stale" });
+    assert.equal(stale.status, 409);
+    assert.match((await stale.json()).error, /Reload before deleting/);
+    assert.deepEqual(catalog.watch("daily"), saved);
+    assert.deepEqual(JSON.parse(fs.readFileSync(stateFile, "utf8")), state);
+
+    const run = host.launch("sample", { context: "Keep history" }, "kept", {
+      watchId: "daily",
+      eventId: "scheduled",
+      reason: "Daily check",
+    });
+    const snapshot = host.store.snapshot(run.id);
+    const deleted = await remove({ revision: saved.revision });
+    assert.equal(deleted.status, 200);
+    assert.deepEqual(await deleted.json(), { deleted: true });
+    assert.equal(fs.existsSync(stateFile), false);
+    for (const endpoint of ["/pipeline-watches", "/watch-dashboard"]) {
+      const response = await fetch(`${origin}/api${endpoint}`);
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), []);
+    }
+    assert.equal((await remove({ revision: saved.revision })).status, 404);
+    assert.equal(
+      (await waitForRun(() => host.store.get(run.id))).status,
+      "completed",
+    );
+    assert.equal(
+      (await fetch(`${origin}/api/pipeline-runs/${run.id}`)).status,
+      200,
+    );
+    assert.deepEqual(host.store.snapshot(run.id), snapshot);
+    host.store.verify(run.id);
+    assert.equal(catalog.workflow("sample").value.id, "sample");
+    assert.throws(() => createCatalog(root).watch("daily"), { status: 404 });
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
 
 test("queue API returns the latest 30 participating submissions and counts older pending runs", async () => {
   const root = temporaryRoot();
@@ -242,7 +704,7 @@ test("watch dashboard retains each watch's previous output until its next schedu
   }
 });
 
-test("completed run downloads include verified reports and execution assets, not unrelated files", async () => {
+test("completed run downloads contain only final results and reports, ignoring oversized execution files", async () => {
   const root = temporaryRoot();
   const reports = path.join(fs.realpathSync(root), "reports");
   fs.mkdirSync(reports);
@@ -250,10 +712,24 @@ test("completed run downloads include verified reports and execution assets, not
   const reportText = "# Feature report\nVerified implementation and tests.";
   fs.writeFileSync(reportFile, reportText);
   const reportHash = createHash("sha256").update(reportText).digest("hex");
+  const intermediate = path.join(reports, "intermediate.md");
+  fs.writeFileSync(intermediate, "# Intermediate evidence");
+  const intermediateHash = createHash("sha256")
+    .update(fs.readFileSync(intermediate))
+    .digest("hex");
   const fixture = fixtureBackend();
   const backend: AgentBackend = {
     ...fixture,
     async execute(request, signal) {
+      if (
+        request.purpose === "stage" &&
+        path.basename(request.directory).startsWith("discover-alpha-") &&
+        Object.hasOwn(request.schema.properties ?? {}, "report")
+      )
+        return {
+          summary: "Intermediate evidence",
+          report: { path: intermediate, sha256: intermediateHash },
+        };
       if (
         request.purpose === "stage" &&
         path.basename(request.directory).startsWith("report-writer-")
@@ -266,6 +742,10 @@ test("completed run downloads include verified reports and execution assets, not
     },
   };
   const definition = workflow();
+  definition.stages[0].outputSchema.properties = {
+    ...definition.stages[0].outputSchema.properties,
+    report: { type: "object" },
+  };
   definition.stages[1].agents[0].allowedFolders = [reports];
   const catalog = createCatalog(root);
   catalog.saveWorkflow(definition);
@@ -330,19 +810,11 @@ test("completed run downloads include verified reports and execution assets, not
       strFromU8(archive["reports/report-writer/feature-report.md"]),
       reportText,
     );
-    assert.equal(
-      strFromU8(
-        archive[`execution/attempts/${path.basename(attempt)}/stdout.log`],
-      ),
-      "Fixture execution log",
-    );
-    assert(archive["execution/result.json"]);
-    assert(archive["execution/snapshot.json"]);
-    assert(
-      !Object.keys(archive).some((name) =>
-        /unrelated|execution\.claims/.test(name),
-      ),
-    );
+    assert.deepEqual(JSON.parse(strFromU8(archive["result.json"])), run.result);
+    assert.deepEqual(Object.keys(archive).sort(), [
+      "reports/report-writer/feature-report.md",
+      "result.json",
+    ]);
     assert.equal(
       (await assets(run.id, { Origin: "https://example.com" })).status,
       403,
@@ -373,13 +845,14 @@ test("completed run downloads include verified reports and execution assets, not
 
     const link = path.join(attempt, "external-link");
     fs.symlinkSync(reports, link);
-    const linked = await assets(run.id);
-    assert.equal(linked.status, 409);
-    assert.match((await linked.json()).error, /symbolic links/);
+    assert.equal((await assets(run.id)).status, 200);
     fs.unlinkSync(link);
     const large = path.join(directory, "large.json");
     fs.writeFileSync(large, "");
     fs.truncateSync(large, 64 * 1024 * 1024 + 1);
+    fs.truncateSync(path.join(attempt, "stdout.log"), 64 * 1024 * 1024 + 1);
+    assert.equal((await assets(run.id)).status, 200);
+    fs.truncateSync(reportFile, 64 * 1024 * 1024 + 1);
     assert.equal((await assets(run.id)).status, 413);
   } finally {
     await host.close();
@@ -398,10 +871,12 @@ test("downloads include every final agent's nested file references without a rep
   const diagram = path.join(reports, "diagrams.md");
   const nested = path.join(reports, "nested", "findings.md");
   const outside = path.join(fs.realpathSync(root), "source.ts");
+  const citedLog = path.join(reports, "evidence.log");
   fs.writeFileSync(report, "# Findings");
   fs.writeFileSync(diagram, "```mermaid\nflowchart TD\nA --> B\n```");
   fs.writeFileSync(nested, "# Supporting findings");
   fs.writeFileSync(outside, "Unrelated source");
+  fs.writeFileSync(citedLog, "Cited evidence, not a final artifact");
   fs.writeFileSync(path.join(reports, "unreferenced.md"), "Not an output");
   const definition = workflow();
   definition.stages[1].agents = [
@@ -423,7 +898,8 @@ test("downloads include every final agent's nested file references without a rep
           return {
             summary: "Findings",
             reportArtifact: { reportPath: report },
-            evidence: [{ paths: [nested, report, outside] }],
+            files: [nested],
+            evidence: [{ paths: [nested, report, outside, citedLog] }],
             workspace: reports,
           };
         if (path.basename(request.directory).startsWith("report-diagram-"))
@@ -469,10 +945,10 @@ test("downloads include every final agent's nested file references without a rep
         "outputs/report-writer/1/nested/findings.md",
       ],
     );
-    assert(archive["execution/result.json"]);
+    assert.deepEqual(JSON.parse(strFromU8(archive["result.json"])), run.result);
     assert(
       !Object.keys(archive).some((name) =>
-        /source\.ts|unreferenced/.test(name),
+        /source\.ts|unreferenced|evidence\.log/.test(name),
       ),
     );
 
@@ -494,6 +970,67 @@ test("downloads include every final agent's nested file references without a rep
     );
     fs.unlinkSync(path.dirname(nested));
     fs.mkdirSync(path.dirname(nested));
+    assert.throws(() => runAssets(host.store, run.id), /ENOENT/);
+  } finally {
+    await host.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("blocked publication downloads preserve Markdown reportPaths without claiming a completed result", async () => {
+  const root = temporaryRoot();
+  const reports = path.join(fs.realpathSync(root), "reports");
+  fs.mkdirSync(reports);
+  const report = path.join(reports, "digest.md");
+  fs.writeFileSync(
+    report,
+    "# Teams digest\n\n## Important\nDetailed findings.",
+  );
+  const definition = workflow();
+  definition.stages[1].agents[0].allowedFolders = [reports];
+  const fixture = fixtureBackend();
+  const backend: AgentBackend = {
+    ...fixture,
+    async execute(request, signal) {
+      if (
+        request.purpose === "stage" &&
+        path.basename(request.directory).startsWith("report-writer-")
+      )
+        return {
+          status: "blocked",
+          summary: "File upload access denied.",
+          reportPaths: [report],
+        };
+      return fixture.execute(request, signal);
+    },
+  };
+  const catalog = createCatalog(root);
+  catalog.saveWorkflow(definition);
+  const host = createRunHost(root, catalog, backend);
+  try {
+    const started = host.launch(
+      definition.id,
+      { context: "Report survives publication failure" },
+      "blocked-markdown",
+    );
+    const run = await waitForRun(() => host.store.get(started.id));
+    assert.equal(run.status, "blocked", run.error);
+    const archive = unzipSync(runAssets(host.store, run.id));
+    assert.equal(
+      strFromU8(archive["outputs/report-writer/1/digest.md"]),
+      fs.readFileSync(report, "utf8"),
+    );
+    assert.equal(
+      JSON.parse(strFromU8(archive["run-status.json"])).status,
+      "blocked",
+    );
+    assert.equal(
+      JSON.parse(strFromU8(archive["outputs/report-writer.json"])).output
+        .status,
+      "blocked",
+    );
+    assert(!Object.hasOwn(archive, "result.json"));
+    fs.unlinkSync(report);
     assert.throws(() => runAssets(host.store, run.id), /ENOENT/);
   } finally {
     await host.close();
@@ -553,7 +1090,7 @@ test("instruction file browsing and saves reject invalid Markdown without changi
     );
     assert.equal(badDirectory.status, 400);
     for (const [file, message] of [
-      ["relative.md", "absolute path"],
+      ["relative.md", "STRAND_WORKFLOWS_DIR"],
       [path.join(directory, "missing.md"), "ENOENT"],
       [path.join(directory, "not-markdown.txt"), ".md file"],
       [path.join(directory, "empty.md"), "cannot be empty"],
@@ -596,7 +1133,6 @@ test("HTTP API validates launches, blocks foreign origins and never serves HTML 
   ].sort();
   const catalog = createCatalog(root);
   const definition = workflow();
-  definition.stages[1].instructions = "Summarize only verified evidence.";
   definition.stages[1].agents[0].instructions = "Explain uncertainty.";
   definition.stages[1].agents[0].allowedFolders = [folder, otherFolder, folder];
   definition.stages[1].skills = ["evidence"];
@@ -757,6 +1293,7 @@ test("HTTP API validates launches, blocks foreign origins and never serves HTML 
     );
     assert.equal(runDetailsResponse.status, 200);
     const runDetails = await runDetailsResponse.json();
+    assert.equal(runDetails.kind, "workflow");
     assert.deepEqual(
       runDetails.stages,
       definition.stages.map(({ id, name, agents }) => ({
@@ -779,7 +1316,6 @@ test("HTTP API validates launches, blocks foreign origins and never serves HTML 
     assert.equal(activityResponse.status, 200);
     const activity = await activityResponse.json();
     assert.deepEqual(activity.input, {
-      stageInstructions: "Summarize only verified evidence.",
       agentInstructions: "Explain uncertainty.",
       allowedFolders,
       skills: [skill.value],

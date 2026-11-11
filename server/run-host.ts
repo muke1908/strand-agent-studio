@@ -12,12 +12,21 @@ import {
   resolveWorkflowFolders,
 } from "./allowed-folders.ts";
 import { stageSkipSchema } from "../shared/contracts.ts";
-import type { Json, QueueState, Run, StageSkip } from "../shared/contracts.ts";
+import type {
+  Json,
+  QueueState,
+  Run,
+  RunSummary,
+  StageSkip,
+} from "../shared/contracts.ts";
+import { isAction } from "../shared/workflow-kind.ts";
 import { checkpointPrefix } from "./run-checkpoint.ts";
 import { assertAttemptStopped } from "./process-runner.ts";
 import { createResultSummaries } from "./result-summary.ts";
-import { resolveWorkflowInstructions } from "./instruction-files.ts";
 import { createWatchActionCompiler } from "./watch-action-compiler.ts";
+import { createInputSchemaCompiler } from "./input-schema-compiler.ts";
+import { createWatchScheduleCompiler } from "./watch-schedule-compiler.ts";
+import { cleanupRunWorktrees } from "./run-resources.ts";
 
 export class WorkflowBusyError extends Error {
   readonly status = 409;
@@ -38,6 +47,8 @@ export function createRunHost(
   const store = createRunStore(root);
   const summaries = createResultSummaries(store, backend);
   const actionCompiler = createWatchActionCompiler(root, catalog, backend);
+  const inputCompiler = createInputSchemaCompiler(root, backend);
+  const scheduleCompiler = createWatchScheduleCompiler(root, backend);
   const active = new Map<
     string,
     { abort: AbortController; promise: Promise<void>; queued: boolean }
@@ -75,52 +86,23 @@ export function createRunHost(
     const other = busy(workflowId, excludeId);
     if (other) throw new WorkflowBusyError(other.id);
   }
-  function containsFolder(parent: string, child: string): boolean {
-    const relative = path.relative(parent, child);
-    return (
-      relative === "" ||
-      (relative !== ".." &&
-        !relative.startsWith(`..${path.sep}`) &&
-        !path.isAbsolute(relative))
-    );
-  }
-  function assertNoContinuationConflict(
-    snapshot: Pick<Snapshot, "workflow" | "allowedFolders" | "continuation">,
-    excludeId?: string,
-  ): void {
-    const folders = (value: typeof snapshot) => [
-      ...(value.allowedFolders ?? []),
-      ...value.workflow.stages.flatMap((stage) =>
-        stage.agents.flatMap((agent) => agent.allowedFolders ?? []),
-      ),
-    ];
-    for (const other of store.list()) {
-      if (
-        other.id === excludeId ||
-        !["queued", "running"].includes(other.status)
-      )
-        continue;
-      if (!snapshot.continuation && !other.continuation) continue;
-      const pinned = store.snapshot(other.id);
-      if (
-        snapshot.workflow.id === pinned.workflow.id ||
-        folders(snapshot).some((folder) =>
-          folders(pinned).some(
-            (otherFolder) =>
-              containsFolder(folder, otherFolder) ||
-              containsFolder(otherFolder, folder),
-          ),
-        )
-      )
-        throw Object.assign(
-          new Error(
-            `Run ${other.id} is using this workflow or shared folders. Stop or finish it before continuing.`,
-          ),
-          { status: 409 },
-        );
-    }
-  }
   let closing = false;
+  function deleteHistory(runs: Run[]): number {
+    if (
+      runs.some(
+        (run) =>
+          active.has(run.id) ||
+          queue.has(run.id) ||
+          ["queued", "running"].includes(run.status),
+      )
+    )
+      throw Object.assign(
+        new Error("Stop or finish active runs before deleting their history."),
+        { status: 409 },
+      );
+    for (const run of runs) store.removeFromHistory(run.id);
+    return runs.length;
+  }
   function pump(): void {
     if (closing || active.size >= 2) return;
     const serialActive = [...active.values()].some((item) => item.queued);
@@ -164,6 +146,18 @@ export function createRunHost(
         release();
       }
     } else if (run.status === "queued") queue.set(run.id, run);
+    if (!["running", "queued"].includes(run.status)) {
+      try {
+        cleanupRunWorktrees(store, run.id);
+      } catch (error) {
+        const message = `Workspace recovery for ${run.id} failed: ${error instanceof Error ? error.message : String(error)}`;
+        errors.push(message);
+        console.error(message);
+        run.status = "blocked";
+        run.error = [run.error, message].filter(Boolean).join("; ");
+        store.save(run);
+      }
+    }
   }
   queueMicrotask(pump);
   return {
@@ -171,9 +165,22 @@ export function createRunHost(
     summaries,
     errors,
     busy,
+    deleteRunHistory: (id: string) => deleteHistory([store.get(id)]),
+    deleteWorkflowHistory: (workflowId: string, kind?: RunSummary["kind"]) =>
+      deleteHistory(
+        store
+          .history()
+          .filter(
+            (run) =>
+              run.workflowId === workflowId &&
+              (kind === undefined ||
+                isAction(store.snapshot(run.id).workflow) ===
+                  (kind === "action")),
+          ),
+      ),
     queueState(): QueueState {
       const runs = store
-        .list()
+        .history()
         .filter((run) => run.queued)
         .sort((a, b) => compareQueueOrder(b, a));
       return {
@@ -183,6 +190,8 @@ export function createRunHost(
       };
     },
     compileWatchAction: actionCompiler.compile,
+    compileInputSchema: inputCompiler.compile,
+    compileWatchSchedule: scheduleCompiler.compile,
     launch(
       workflowId: string,
       input: Json,
@@ -221,12 +230,19 @@ export function createRunHost(
         const diagnostic = backend.diagnostics();
         if (!diagnostic.available)
           throw Object.assign(new Error(diagnostic.reason), { status: 503 });
-        const workflow = resolveWorkflowInstructions(
-          resolveWorkflowFolders(catalog.workflow(workflowId).value),
+        const workflow = catalog.runtimeWorkflow(
+          catalog.workflow(workflowId).value,
         );
-        validateJson(workflow.inputSchema, input);
+        const paths = catalog.config.paths;
+        const shared = Object.keys(paths).length
+          ? {
+              paths,
+              allowedFolders: resolveAllowedFolders(Object.values(paths)),
+            }
+          : undefined;
+        if (!trigger || typeof input !== "string")
+          validateJson(workflow.inputSchema, input);
         const skills = catalog.skills().map((item) => item.value);
-        assertNoContinuationConflict({ workflow });
         const run = store.create(
           workflow,
           skills,
@@ -235,6 +251,7 @@ export function createRunHost(
           backend.id,
           trigger,
           allowAllTools,
+          shared,
         );
         queue.set(run.id, run);
         queueMicrotask(pump);
@@ -309,8 +326,36 @@ export function createRunHost(
           store.verify(id);
           const snapshot = store.snapshot(id);
           let workflow = snapshot.workflow;
+          const current =
+            workflow.stages[0]?.id === fromStageId
+              ? catalog
+                  .workflows()
+                  .find(({ value }) => value.id === source.workflowId)
+              : undefined;
+          if (
+            current &&
+            (!source.trigger || typeof snapshot.input !== "string")
+          ) {
+            try {
+              validateJson(current.value.inputSchema, snapshot.input);
+            } catch (error) {
+              if (
+                !(error instanceof Error) ||
+                !("status" in error) ||
+                error.status !== 400
+              )
+                throw error;
+              throw Object.assign(
+                new Error(
+                  `The saved inputs no longer satisfy this workflow's input schema. Launch a new run with corrected inputs instead of retrying the same values. ${error.message}`,
+                  { cause: error },
+                ),
+                { status: 400 },
+              );
+            }
+          }
           if (latestInstructions) {
-            const current = resolveWorkflowFolders(
+            const current = catalog.runtimeWorkflow(
               catalog.workflow(source.workflowId).value,
             );
             const structure = (value: typeof workflow) => ({
@@ -328,11 +373,18 @@ export function createRunHost(
             if (!isDeepStrictEqual(structure(current), structure(workflow)))
               throw Object.assign(
                 new Error(
-                  "Workflow structure or permissions changed. Restart with pinned instructions or launch a new run.",
+                  "Workflow structure or permissions changed. Launch a new run.",
                 ),
                 { status: 409 },
               );
-            workflow = resolveWorkflowInstructions(current);
+            if (!isDeepStrictEqual(snapshot.paths ?? {}, catalog.config.paths))
+              throw Object.assign(
+                new Error(
+                  "Configured paths changed. Launch a new run instead of redirecting a continuation.",
+                ),
+                { status: 409 },
+              );
+            workflow = current;
           }
           if (snapshot.backendId !== backend.id)
             throw Object.assign(
@@ -375,6 +427,7 @@ export function createRunHost(
               }
             }
           const checkpoints = checkpointPrefix(store, id, fromStageId);
+          cleanupRunWorktrees(store, id);
           const index = snapshot.workflow.stages.findIndex(
             (stage) => stage.id === fromStageId,
           );
@@ -423,7 +476,6 @@ export function createRunHost(
               ]),
             ),
           };
-          assertNoContinuationConflict({ ...snapshot, continuation });
           const run = store.create(
             workflow,
             snapshot.skills,
@@ -438,6 +490,7 @@ export function createRunHost(
               ...(snapshot.allowedFolders
                 ? { allowedFolders: snapshot.allowedFolders }
                 : {}),
+              ...(snapshot.paths ? { paths: snapshot.paths } : {}),
             },
           );
           queue.set(run.id, run);
@@ -449,6 +502,31 @@ export function createRunHost(
       } finally {
         release();
       }
+    },
+    async rerunStage(
+      id: string,
+      fromStageId: string,
+      requestId: string,
+      latestInstructions = true,
+    ): Promise<Run> {
+      if (
+        !closing &&
+        !store.list().some((run) => run.requestId === requestId)
+      ) {
+        checkpointPrefix(store, id, fromStageId);
+        const execution = active.get(id)?.promise;
+        if (execution || queue.has(id)) {
+          this.stop(id);
+          await execution;
+        }
+      }
+      return this.rerun(
+        id,
+        fromStageId,
+        requestId,
+        undefined,
+        latestInstructions,
+      );
     },
     resume(id: string): Run {
       if (closing)
@@ -472,7 +550,6 @@ export function createRunHost(
       try {
         store.verify(id);
         assertWorkflowIdle(run.workflowId, id);
-        assertNoContinuationConflict(store.snapshot(id), id);
         const release = store.lease(id);
         try {
           delete run.error;
@@ -500,7 +577,11 @@ export function createRunHost(
     },
     async close(): Promise<void> {
       closing = true;
-      await actionCompiler.close();
+      await Promise.all([
+        actionCompiler.close(),
+        inputCompiler.close(),
+        scheduleCompiler.close(),
+      ]);
       for (const item of active.values())
         item.abort.abort(new Error("Host shutting down"));
       await Promise.all([...active.values()].map((item) => item.promise));

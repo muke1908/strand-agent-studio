@@ -134,7 +134,7 @@ export function createWatchActionCompiler(
     compile(
       checkWorkflowId: string,
       choice: WatchActionRequest,
-      checkInputs: Record<string, Reference>,
+      checkInputs: Record<string, Reference> | string,
     ) {
       if (closing)
         throw Object.assign(new Error("Host is shutting down"), {
@@ -143,10 +143,13 @@ export function createWatchActionCompiler(
       const request = watchActionRequestSchema.parse(choice);
       const check = catalog.workflow(checkWorkflowId);
       const action = catalog.workflow(request.workflowId);
-      const properties = object(action.value.inputSchema.properties ?? {});
+      const inputs = typeof checkInputs === "string" ? undefined : checkInputs;
+      const properties = inputs
+        ? object(action.value.inputSchema.properties ?? {})
+        : {};
       const inputBindings: Record<string, Reference> = Object.fromEntries(
         Object.keys(properties)
-          .filter((name) => Object.hasOwn(checkInputs, name))
+          .filter((name) => inputs && Object.hasOwn(inputs, name))
           .map((name) => [
             name,
             {
@@ -155,22 +158,24 @@ export function createWatchActionCompiler(
             },
           ]),
       );
-      for (const [name, field] of Object.entries(properties)) {
-        if (!Object.hasOwn(checkInputs, name)) continue;
-        const binding = checkInputs[name];
-        if (binding.source === "literal")
-          validateJson(object(field), binding.value);
-      }
-      for (const name of Array.isArray(action.value.inputSchema.required)
-        ? action.value.inputSchema.required
-        : []) {
-        if (typeof name !== "string" || !Object.hasOwn(inputBindings, name))
-          throw Object.assign(
-            new Error(
-              `Action workflow needs "${String(name)}", which the check inputs do not supply. Choose a workflow with compatible inputs.`,
-            ),
-            { status: 400 },
-          );
+      if (inputs) {
+        for (const [name, field] of Object.entries(properties)) {
+          if (!Object.hasOwn(inputs, name)) continue;
+          const binding = inputs[name];
+          if (binding.source === "literal")
+            validateJson(object(field), binding.value);
+        }
+        for (const name of Array.isArray(action.value.inputSchema.required)
+          ? action.value.inputSchema.required
+          : []) {
+          if (typeof name !== "string" || !Object.hasOwn(inputBindings, name))
+            throw Object.assign(
+              new Error(
+                `Action workflow needs "${String(name)}", which the check inputs do not supply. Choose a workflow with compatible inputs.`,
+              ),
+              { status: 400 },
+            );
+        }
       }
       const selected = resultSchema(check.value);
       const id = randomUUID();
@@ -228,6 +233,9 @@ export function createWatchActionCompiler(
             workflowId: request.workflowId,
             whenToRun: request.whenToRun,
             conditions: plan.conditions,
+            ...(typeof checkInputs === "string"
+              ? { input: { source: "input", pointer: "" } }
+              : {}),
             inputBindings,
             ...(plan.deduplicationPointer === null
               ? {}

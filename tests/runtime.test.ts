@@ -15,6 +15,291 @@ import { createRunStore } from "../server/run-store.ts";
 import { executeRun } from "../server/run-engine.ts";
 import { checkpointPrefix } from "../server/run-checkpoint.ts";
 import { executeProcess } from "../server/process-runner.ts";
+import type { Json } from "../shared/contracts.ts";
+
+test("plain-language contracts pass the original input and complete results without bindings", async (t) => {
+  for (const parallel of [false, true]) {
+    await t.test(
+      parallel ? "parallel results" : "single scalar result",
+      async () => {
+        const root = temporaryRoot();
+        const catalog = createCatalog(root);
+        const definition = workflow();
+        const original = { context: "Keep the complete user request." };
+        const outputs: Record<string, Json> = parallel
+          ? {
+              alpha: {
+                scope: "src/feature.ts",
+                solution: ["Reuse the existing helper", "Test recovery"],
+                evidence: { lines: [12, 24] },
+              },
+              beta: "The complete second perspective, without summarization.",
+            }
+          : { alpha: true };
+        if (!parallel) definition.stages[0].agents.length = 1;
+        for (const stage of definition.stages) {
+          stage.expectedOutput = `Return the complete result of ${stage.name}.`;
+          stage.inputs = {};
+        }
+        catalog.saveWorkflow(definition);
+        const base = fixtureBackend();
+        const requests: Parameters<AgentBackend["execute"]>[0][] = [];
+        const backend: AgentBackend = {
+          ...base,
+          async execute(request, signal) {
+            requests.push(request);
+            if (request.purpose === "schema") {
+              assert.match(
+                request.prompt,
+                /## Expected output\nReturn the complete result/,
+              );
+              assert.doesNotMatch(request.prompt, /## Starting schema/);
+              assert.match(request.prompt, /required top-level "status"/);
+              assert.match(
+                request.prompt,
+                /"enum":\["blocked","failed","completed"\]/,
+              );
+              assert.match(
+                request.prompt,
+                /scalar or array results.*required "result" property/,
+              );
+              assert.match(
+                request.prompt,
+                /On blocked or failed outcomes, allow unavailable success data to be omitted/,
+              );
+            }
+            if (request.purpose === "stage") {
+              const first = request.prompt.includes('Execute stage "Discover"');
+              assert.match(
+                request.prompt,
+                /## Expected output\nReturn the complete result/,
+              );
+              assert.match(request.prompt, /Keep the complete user request/);
+              assert.deepEqual(
+                request.input,
+                first ? original : parallel ? outputs : outputs.alpha,
+              );
+              if (first)
+                return request.prompt.includes("You are Alpha.")
+                  ? outputs.alpha
+                  : outputs.beta;
+              return { summary: "Complete report" };
+            }
+            return base.execute(request, signal);
+          },
+        };
+        const host = createRunHost(root, catalog, backend);
+        try {
+          const run = host.launch(definition.id, original, "natural-handoff");
+          const finished = await waitForRun(() => host.store.get(run.id));
+          assert.equal(finished.status, "completed", finished.error);
+          const report = requests.find(
+            (request) =>
+              request.purpose === "stage" &&
+              request.prompt.includes('Execute stage "Report"'),
+          )!;
+          assert.deepEqual(
+            unitDetails(host.store, run.id, "report/writer").input.stageInput,
+            report.input,
+          );
+          assert.equal(
+            unitDetails(host.store, run.id, "@schema/report").input,
+            definition.stages[1].expectedOutput,
+          );
+          assert.deepEqual(
+            JSON.parse(
+              report.prompt.split("## Complete accepted handoffs\n")[1],
+            ),
+            Object.fromEntries(
+              Object.entries(outputs).map(([agent, output]) => [
+                `discover/${agent}`,
+                output,
+              ]),
+            ),
+          );
+        } finally {
+          await host.close();
+          fs.rmSync(root, { recursive: true });
+        }
+      },
+    );
+  }
+});
+
+test("legacy stage instructions are ignored while agent instructions drive execution and contracts", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const definition = workflow();
+  definition.stages[0].instructions = "Legacy stage policy must not execute.";
+  definition.stages[0].agents[0].instructions =
+    "Follow the agent-owned policy.";
+  catalog.saveWorkflow(definition);
+  const base = fixtureBackend();
+  const calls: Parameters<AgentBackend["execute"]>[0][] = [];
+  const backend: AgentBackend = {
+    ...base,
+    async execute(request, signal) {
+      calls.push(request);
+      assert.doesNotMatch(request.prompt, /Legacy stage policy/);
+      return base.execute(request, signal);
+    },
+  };
+  const host = createRunHost(root, catalog, backend);
+  try {
+    const run = host.launch(
+      definition.id,
+      { context: "Use only agent instructions." },
+      "agent-only-instructions",
+    );
+    const finished = await waitForRun(() => host.store.get(run.id));
+    assert.equal(finished.status, "completed", finished.error);
+    const contract = calls.find(
+      (request) =>
+        request.purpose === "schema" && request.prompt.includes('"Discover"'),
+    )!;
+    const agent = calls.find(
+      (request) =>
+        request.purpose === "stage" &&
+        request.prompt.includes("You are Alpha."),
+    )!;
+    assert.match(contract.prompt, /Follow the agent-owned policy/);
+    assert.match(contract.prompt, /required top-level "status"/);
+    assert.match(contract.prompt, /"enum":\["blocked","failed","completed"\]/);
+    assert.match(agent.prompt, /Follow the agent-owned policy/);
+    const details = unitDetails(host.store, run.id, "discover/alpha");
+    assert.equal(Object.hasOwn(details.input, "stageInstructions"), false);
+  } finally {
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("repository-only actions return scalar counts, while blockers never publish a count", async () => {
+  const root = temporaryRoot();
+  const catalog = createCatalog(root);
+  const definition = workflow("assigned-pr-count");
+  definition.inputSchema = {
+    type: "object",
+    properties: { repositoryUrl: { type: "string", minLength: 1 } },
+    required: ["repositoryUrl"],
+    additionalProperties: false,
+  };
+  const stage = definition.stages[0];
+  stage.inputs = {
+    repositoryUrl: { source: "input", pointer: "/repositoryUrl" },
+  };
+  stage.outputSchema = { type: "integer", minimum: 0 };
+  stage.expectedOutput = "Return only the nonnegative integer count.";
+  stage.agents = [stage.agents[0]];
+  definition.stages = [stage];
+  catalog.saveWorkflow(definition);
+  const base = fixtureBackend();
+  let output: Json = 0;
+  const backend: AgentBackend = {
+    ...base,
+    async execute(request, signal) {
+      if (request.purpose === "stage") {
+        assert.deepEqual(request.input, {
+          repositoryUrl: "https://dev.azure.com/example/project/_git/repo",
+        });
+        assert.deepEqual(request.schema, stage.outputSchema);
+        return output;
+      }
+      return base.execute(request, signal);
+    },
+  };
+  const host = createRunHost(root, catalog, backend);
+  try {
+    const results: Json[] = [
+      0,
+      7,
+      { status: "blocked", summary: "Azure DevOps authentication failed." },
+      { status: "blocked", summary: "Azure DevOps PR API request failed." },
+    ];
+    for (const [index, result] of results.entries()) {
+      output = result;
+      const run = host.launch(
+        definition.id,
+        { repositoryUrl: "https://dev.azure.com/example/project/_git/repo" },
+        `scalar-count-${index}`,
+      );
+      const finished = await waitForRun(() => host.store.get(run.id));
+      if (typeof result === "number") {
+        assert.equal(finished.status, "completed", finished.error);
+        assert.equal(finished.result, result);
+        validateJson(stage.outputSchema, finished.result);
+      } else {
+        assert.equal(finished.status, "blocked");
+        assert.equal(finished.result, undefined);
+        assert.match(finished.error!, /reported status "blocked"/);
+        assert.deepEqual(finished.units["discover/alpha"].output, result);
+      }
+    }
+  } finally {
+    await host.close();
+    fs.rmSync(root, { recursive: true });
+  }
+});
+
+test("action results have no format-dependent wrapping and preserve explicit selections or parallel arrays", async (t) => {
+  for (const mode of ["natural", "selected", "no-description", "parallel"]) {
+    await t.test(mode, async () => {
+      const root = temporaryRoot();
+      const catalog = createCatalog(root);
+      const definition = workflow();
+      const stage = definition.stages[0];
+      definition.stages = [stage];
+      if (mode !== "no-description")
+        stage.expectedOutput = "Return the complete summary object.";
+      if (mode !== "parallel") stage.agents = [stage.agents[0]];
+      if (mode === "selected")
+        definition.result = {
+          source: "stage",
+          stageId: stage.id,
+          agentId: stage.agents[0].id,
+          pointer: "/summary",
+        };
+      catalog.saveWorkflow(definition);
+      const base = fixtureBackend();
+      const output = { summary: "Complete action result" };
+      const host = createRunHost(root, catalog, {
+        ...base,
+        async execute(request, signal) {
+          return request.purpose === "stage"
+            ? output
+            : base.execute(request, signal);
+        },
+      });
+      try {
+        const run = host.launch(
+          definition.id,
+          { context: "Action result defaults" },
+          mode,
+        );
+        const finished = await waitForRun(() => host.store.get(run.id));
+        assert.equal(finished.status, "completed", finished.error);
+        const expected =
+          mode === "selected"
+            ? output.summary
+            : mode === "parallel"
+              ? [output, output]
+              : output;
+        assert.deepEqual(finished.result, expected);
+        assert.deepEqual(
+          host.store.readArtifactIfPresent(run.id, "result.json"),
+          expected,
+        );
+        assert.deepEqual(
+          host.store.readArtifactIfPresent(run.id, "output.json"),
+          stage.agents.map(() => output),
+        );
+      } finally {
+        await host.close();
+        fs.rmSync(root, { recursive: true });
+      }
+    });
+  }
+});
 
 test("stage restart recovers a stopped missing-receipt attempt without repeating completed work", async () => {
   const root = temporaryRoot();
@@ -80,9 +365,8 @@ test("AI-expanded anyOf schemas pass unchanged to agents and downstream handoffs
   const root = temporaryRoot();
   const store = createRunStore(root);
   const definition = workflow();
-  definition.stages[0].instructions = "Collect Azure DevOps discussions.";
   definition.stages[0].agents[0].instructions =
-    "Return report null; collection does not publish reports.";
+    "Collect Azure DevOps discussions. Return report null; collection does not publish reports.";
   definition.stages[0].outputSchema.properties = {
     summary: { type: "string" },
     report: {
@@ -470,8 +754,13 @@ test("linked Markdown is loaded for fresh runs and remains pinned for Resume and
   }
 });
 
-test("accepted blocked outcomes stop stages, preserve sibling evidence, and remain blocked on recovery", async () => {
-  for (const stageId of ["discover", "report"]) {
+test("accepted blocked or failed outcomes stop stages, preserve sibling evidence, and remain blocked on recovery", async () => {
+  for (const [stageId, outcome] of [
+    ["discover", "blocked"],
+    ["report", "blocked"],
+    ["discover", "failed"],
+    ["report", "failed"],
+  ]) {
     const root = temporaryRoot();
     const store = createRunStore(root);
     const definition = workflow();
@@ -494,7 +783,7 @@ test("accepted blocked outcomes stop stages, preserve sibling evidence, and rema
             request.prompt.includes(`You are ${blockedStage.agents[0].name}.`);
           return {
             summary: blocked ? "Required workspace lock is missing." : "Ready.",
-            status: blocked ? "blocked" : "ready",
+            status: blocked ? outcome : "completed",
           };
         }
         return base.execute(request, signal);
@@ -505,14 +794,17 @@ test("accepted blocked outcomes stop stages, preserve sibling evidence, and rema
         definition,
         [],
         { context: "Business blocker" },
-        `blocked-${stageId}`,
+        `${outcome}-${stageId}`,
         backend.id,
       );
       await executeRun(store, run.id, backend, new AbortController().signal);
       const blocked = store.get(run.id);
       assert.equal(blocked.status, "blocked", blocked.error);
       assert.equal(blocked.currentStage, stageId);
-      assert.match(blocked.error!, /reported status "blocked".*rerun/);
+      assert.match(
+        blocked.error!,
+        new RegExp(`reported status "${outcome}".*rerun`),
+      );
       assert.match(blocked.error!, new RegExp(blockedStage.name));
       assert.equal(calls, stageId === "discover" ? 3 : 5);
       for (const agent of blockedStage.agents) {
@@ -524,7 +816,7 @@ test("accepted blocked outcomes stop stages, preserve sibling evidence, and rema
       if (stageId === "discover") {
         assert.deepEqual(blocked.units["discover/beta"].output, {
           summary: "Ready.",
-          status: "ready",
+          status: "completed",
         });
         assert.equal(blocked.units["@schema/report"], undefined);
         assert.equal(blocked.units["report/writer"], undefined);
@@ -1045,7 +1337,6 @@ test("failed agents block progression; resume uses pinned skills/input and accep
     assert.equal(failedDetails.output, undefined);
     assert.equal(failedDetails.unit.attempts[0].error, "Deliberate failure");
     assert.deepEqual(failedDetails.input, {
-      stageInstructions: "",
       agentInstructions: "",
       allowedFolders: pinnedFolders,
       skills: [],

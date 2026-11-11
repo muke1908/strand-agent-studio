@@ -16,7 +16,6 @@ export function supportsForm(schema: Schema): boolean {
     ([, field]) =>
       ["string", "number", "integer", "boolean"].includes(String(field.type)) &&
       !field.oneOf &&
-      !field.anyOf &&
       !field.$ref,
   );
 }

@@ -7,8 +7,14 @@ import {
   ExternalLink,
   Download,
   SkipForward,
+  Trash2,
 } from "lucide-react";
-import type { Run, RunDetails, Unit } from "../../shared/contracts.ts";
+import type {
+  Run,
+  RunDetails,
+  RunSummary,
+  Unit,
+} from "../../shared/contracts.ts";
 import { api, errorMessage, useResource } from "../api.ts";
 import { RunUnitDetails } from "../run-unit-details.tsx";
 import {
@@ -57,64 +63,164 @@ function reportedOutcome(unit?: Unit): string | undefined {
     : undefined;
 }
 
-export function Runs() {
-  const { data, error } = useResource<Run[]>("/pipeline-runs", true);
-  const groups = new Map<string, { name: string; runs: Run[] }>();
-  for (const run of data ?? []) {
+export function Runs({ actions = false }: { actions?: boolean }) {
+  const { data, error, reload } = useResource<RunSummary[]>(
+    "/pipeline-runs",
+    true,
+  );
+  const kind = actions ? "action" : "workflow";
+  const runs = data?.filter((run) => run.kind === kind);
+  const [deleteError, setDeleteError] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  async function remove(url: string, message: string) {
+    if (!window.confirm(message)) return;
+    setDeleting(true);
+    setDeleteError("");
+    try {
+      await api(url, { method: "DELETE" });
+      reload();
+    } catch (failure) {
+      setDeleteError(errorMessage(failure));
+    } finally {
+      setDeleting(false);
+    }
+  }
+  const groups = new Map<
+    string,
+    { name: string; runs: Run[]; activeRuns: Run[] }
+  >();
+  for (const run of runs ?? []) {
     let group = groups.get(run.workflowId);
     if (!group) {
-      group = { name: run.workflowName, runs: [] };
+      group = { name: run.workflowName, runs: [], activeRuns: [] };
       groups.set(run.workflowId, group);
     }
     if (group.runs.length < 10) group.runs.push(run);
+    if (run.status === "running" || run.status === "queued")
+      group.activeRuns.push(run);
   }
   return (
     <div className="page">
       <PageHeader
-        eyebrow="EXECUTION HISTORY"
-        title="Runs"
-        description="The 10 most recent runs for each workflow."
+        eyebrow={actions ? "ACTION ACTIVITY" : "WORKFLOW ACTIVITY"}
+        title={actions ? "Action runs" : "Workflow runs"}
+        description={`Active runs and recent history, grouped by ${kind}.`}
       />
-      <ErrorNotice error={error} />
+      <ErrorNotice error={deleteError || error} />
       {!data ? (
         <Loading />
-      ) : !data.length ? (
+      ) : !runs?.length ? (
         <EmptyState
-          title="No runs yet"
-          description="Open a workflow and give it some context."
+          title={actions ? "No action runs yet" : "No runs yet"}
+          description={`Open ${actions ? "an action" : "a workflow"} and give it some context.`}
         >
-          <Link className="button" to="/pipelines">
-            Explore workflows
+          <Link className="button" to={actions ? "/actions" : "/pipelines"}>
+            Explore {actions ? "actions" : "workflows"}
           </Link>
         </EmptyState>
       ) : (
-        <section className="run-history" aria-label="Recent runs">
+        <section className="run-history card-grid" aria-label="Recent runs">
           {Array.from(groups, ([workflowId, group]) => (
-            <section key={workflowId} aria-labelledby={`runs-${workflowId}`}>
+            <section
+              key={workflowId}
+              className="run-group-card"
+              aria-labelledby={`runs-${workflowId}`}
+            >
               <div className="section-heading">
                 <h2 id={`runs-${workflowId}`}>{group.name}</h2>
-                <span className="eyebrow">
-                  {group.runs.length} {group.runs.length === 1 ? "run" : "runs"}
+                <span className="muted">
+                  {group.activeRuns.length
+                    ? `${group.activeRuns.length} active`
+                    : "No active runs"}
                 </span>
+                <button
+                  className="icon-button danger"
+                  aria-label={`Delete ${group.name} history`}
+                  title={
+                    group.activeRuns.length
+                      ? "Stop or finish active runs before deleting this group."
+                      : "Delete this group's entire run history"
+                  }
+                  disabled={deleting || group.activeRuns.length > 0}
+                  onClick={() =>
+                    void remove(
+                      `/pipelines/${workflowId}/run-history?kind=${kind}`,
+                      `Delete all ${kind} run history for "${group.name}", including older runs? The ${kind} and generated files will be kept.`,
+                    )
+                  }
+                >
+                  <Trash2 size={14} aria-hidden="true" />
+                </button>
               </div>
-              <div className="list-panel">
-                {group.runs.map((run) => (
+              <div className="run-group-current">
+                {(group.activeRuns.length
+                  ? group.activeRuns
+                  : group.runs.slice(0, 1)
+                ).map((run) => (
                   <Link
                     key={run.id}
-                    className="list-row"
+                    className="list-row run-group-link"
                     to={`/runs/${run.id}`}
                   >
                     <div>
                       <strong>
-                        {run.trigger ? run.trigger.reason : "Manual run"}
+                        {group.activeRuns.length
+                          ? "Open active run"
+                          : "Open latest run"}
                       </strong>
+                      <span>
+                        {run.trigger ? run.trigger.reason : "Manual run"}
+                      </span>
                       <span>{new Date(run.createdAt).toLocaleString()}</span>
                     </div>
                     <StatusBadge status={run.status} />
-                    <ExternalLink size={14} />
+                    <ExternalLink size={14} aria-hidden="true" />
                   </Link>
                 ))}
               </div>
+              <details className="run-group-history">
+                <summary>Recent runs ({group.runs.length})</summary>
+                <div className="list-panel">
+                  {group.runs.map((run) => (
+                    <div key={run.id} className="run-history-row">
+                      <Link className="list-row" to={`/runs/${run.id}`}>
+                        <div>
+                          <strong>
+                            {run.trigger ? run.trigger.reason : "Manual run"}
+                          </strong>
+                          <span>
+                            {new Date(run.createdAt).toLocaleString()}
+                          </span>
+                        </div>
+                        <StatusBadge status={run.status} />
+                        <ExternalLink size={14} aria-hidden="true" />
+                      </Link>
+                      <button
+                        className="icon-button danger"
+                        aria-label={`Delete run ${run.id} from history`}
+                        title={
+                          run.status === "running" || run.status === "queued"
+                            ? "Stop or finish this run before deleting its history."
+                            : "Delete this run from history"
+                        }
+                        disabled={
+                          deleting ||
+                          run.status === "running" ||
+                          run.status === "queued"
+                        }
+                        onClick={() =>
+                          void remove(
+                            `/pipeline-runs/${run.id}`,
+                            `Delete this run from history? The ${kind} and generated files will be kept.`,
+                          )
+                        }
+                      >
+                        <Trash2 size={14} aria-hidden="true" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </details>
             </section>
           ))}
         </section>
@@ -140,7 +246,6 @@ export function RunDetail() {
     sourceRunId: string;
     stageId: string;
     requestId: string;
-    latestInstructions: boolean;
   }>();
   const [skipStage, setSkipStage] = useState<RunDetails["stages"][number]>();
   const skipDialog = useRef<HTMLDialogElement>(null);
@@ -260,28 +365,21 @@ export function RunDetail() {
       setSummaryBusy(false);
     }
   }
-  async function rerun(
-    stage: RunDetails["stages"][number],
-    index: number,
-    latestInstructions = false,
-  ) {
+  async function rerun(stage: RunDetails["stages"][number], index: number) {
     if (
       !run ||
       !window.confirm(
-        `${latestInstructions ? "Restart" : "Rerun"} from "${stage.name}"?\n\n${index ? "Earlier handoffs will be reused; earlier agents will not run." : "All stages will run again, including configured setup actions."}\n${latestInstructions ? "Latest compatible instructions will be loaded. Interrupted attempts can be recovered only after their processes are confirmed stopped.\n" : ""}This stage and every later stage will execute in a new run and may modify the existing workspace or external resources. The original run will remain unchanged.`,
+        `Re-run from "${stage.name}"?\n\n${index ? "Earlier handoffs will be reused; earlier agents will not run." : "All stages will run again, including configured setup actions."}\nLatest compatible instructions will be loaded. Any active execution of this run will be stopped first.\nThis stage and every later stage will execute in a new run and may modify the existing workspace or external resources. Earlier results and the original run's history will be preserved.`,
       )
     )
       return;
     const submission =
-      rerunRequest?.sourceRunId === run.id &&
-      rerunRequest.stageId === stage.id &&
-      rerunRequest.latestInstructions === latestInstructions
+      rerunRequest?.sourceRunId === run.id && rerunRequest.stageId === stage.id
         ? rerunRequest
         : {
             sourceRunId: run.id,
             stageId: stage.id,
             requestId: crypto.randomUUID(),
-            latestInstructions,
           };
     setRerunRequest(submission);
     setBusy(true);
@@ -291,7 +389,7 @@ export function RunDetail() {
         body: JSON.stringify({
           stageId: stage.id,
           requestId: submission.requestId,
-          ...(latestInstructions ? { latestInstructions: true } : {}),
+          latestInstructions: true,
         }),
       });
       setError("");
@@ -310,23 +408,32 @@ export function RunDetail() {
         <Loading />
       </div>
     );
+  const finalStage = run.stages.at(-1);
   return (
     <div className="page">
-      <Link className="back-link" to="/runs">
+      <Link
+        className="back-link"
+        to={run.kind === "action" ? "/action-runs" : "/runs"}
+      >
         <ArrowLeft size={14} />
-        All runs
+        All {run.kind === "action" ? "action" : "workflow"} runs
       </Link>
       <PageHeader
         eyebrow="RUN DETAILS"
         title={run.workflowName}
         description={`${run.id} · ${run.trigger ? run.trigger.reason : "Manual run"} · ${run.allowAllTools ? "All tools allowed" : "Restricted tools"}`}
       >
-        {run.status === "completed" && (
+        {(run.status === "completed" ||
+          (run.status === "blocked" &&
+            finalStage?.agents.some(
+              (agent) =>
+                run.units[`${finalStage.id}/${agent.id}`]?.output !== undefined,
+            ))) && (
           <button
             type="button"
             className="button"
             disabled={downloading}
-            title="Download reports, results, agent outputs, and execution logs as a ZIP"
+            title="Download reports and accepted final outputs as a ZIP"
             onClick={() => void downloadAssets()}
           >
             <Download size={14} />
@@ -366,7 +473,7 @@ export function RunDetail() {
       )}
       {Boolean(run.allowedFolders?.length) && (
         <p className="muted">
-          Legacy run folders: {run.allowedFolders?.join(", ")}
+          Pinned run folders: {run.allowedFolders?.join(", ")}
         </p>
       )}
       {run.stageSkips?.map((override) => (
@@ -386,7 +493,7 @@ export function RunDetail() {
       <ErrorNotice error={error || resource.error || run.error || logs.error} />
       {["blocked", "cancelled"].includes(run.status) && (
         <p className="muted">
-          Restart a stage below to create a fresh attempt with the latest
+          Re-run a stage below to create a fresh attempt with the latest
           compatible instructions. Earlier stages are reused, not repeated.
           Resume keeps the original instructions and accepted outputs.
         </p>
@@ -489,7 +596,6 @@ export function RunDetail() {
                     );
                   }),
               );
-              const inactive = !["queued", "running"].includes(run.status);
               const executionLabel = {
                 completed: "Executed",
                 running: "Executing",
@@ -519,18 +625,6 @@ export function RunDetail() {
                         )}
                       </div>
                       <div className="stage-actions">
-                        {["blocked", "cancelled"].includes(run.status) && (
-                          <button
-                            type="button"
-                            className="button"
-                            aria-label={`Restart from ${stage.name}`}
-                            disabled={busy || !prefixReady}
-                            onClick={() => void rerun(stage, index, true)}
-                          >
-                            <RotateCcw size={14} />
-                            Restart
-                          </button>
-                        )}
                         {["blocked", "cancelled"].includes(run.status) &&
                           run.currentStage === stage.id && (
                             <button
@@ -551,19 +645,18 @@ export function RunDetail() {
                           )}
                         <button
                           type="button"
-                          className="icon-button"
-                          aria-label={`Rerun from ${stage.name}`}
+                          className="button"
+                          aria-label={`Re-run from ${stage.name}`}
                           title={
-                            !inactive
-                              ? "Stop or finish this run before rerunning"
-                              : !prefixReady
-                                ? "Earlier stages need accepted outputs without blockers first"
-                                : `Rerun from ${stage.name}`
+                            !prefixReady
+                              ? "Earlier stages need accepted outputs without blockers first"
+                              : `Re-run from ${stage.name}`
                           }
-                          disabled={busy || !inactive || !prefixReady}
+                          disabled={busy || !prefixReady}
                           onClick={() => void rerun(stage, index)}
                         >
                           <RotateCcw size={15} />
+                          Re-run
                         </button>
                       </div>
                       {run.visits && (

@@ -1,15 +1,11 @@
 import { Plus, Trash2, X } from "lucide-react";
-import {
-  agentSchema,
-  schema,
-  stageSchema,
-  workflowSchema,
-} from "../../shared/contracts.ts";
+import { agentSchema, schema } from "../../shared/contracts.ts";
 import type { Agent, Skill, Stage, Workflow } from "../../shared/contracts.ts";
 import { JsonEditor } from "../components.tsx";
-import { AgentFolders } from "./agent-folders.tsx";
 import { AgentInstructions } from "./agent-instructions.tsx";
 import { StageLoop } from "./stage-loop.tsx";
+import { isAction } from "../../shared/workflow-kind.ts";
+import { ExpectedOutput } from "./expected-output.tsx";
 
 export type Selection =
   | { kind: "workflow" }
@@ -24,6 +20,7 @@ type Props = {
   blocked: boolean;
   disabled: boolean;
   error: (key: string, message: string) => void;
+  addStage?: () => void;
 };
 
 export function Inspector({
@@ -35,6 +32,7 @@ export function Inspector({
   blocked,
   disabled,
   error,
+  addStage,
 }: Props) {
   const stage =
     selection.kind === "workflow"
@@ -63,8 +61,16 @@ export function Inspector({
     <aside className="inspector">
       <div className="inspector-heading">
         <div>
-          <span className="eyebrow">{selection.kind.toUpperCase()}</span>
-          <h2>{agent?.name || stage?.name || "Workflow settings"}</h2>
+          <span className="eyebrow">
+            {selection.kind === "workflow" && isAction(workflow)
+              ? "ACTION"
+              : selection.kind.toUpperCase()}
+          </span>
+          <h2>
+            {agent?.name ||
+              stage?.name ||
+              (isAction(workflow) ? "Action settings" : "Workflow settings")}
+          </h2>
         </div>
         <button
           className="icon-button"
@@ -112,29 +118,36 @@ export function Inspector({
               Queued
             </label>
             <p className="muted" id="workflow-queue-help">
-              Run through the shared queue, one at a time. Unchecked workflows
-              can still run in parallel.
+              Run through the shared queue, one at a time. Unchecked items can
+              still run in parallel.
             </p>
-            <JsonEditor
-              label="Launch input schema"
-              value={workflow.inputSchema}
-              onChange={(value) =>
-                update({ ...workflow, inputSchema: schema.parse(value) })
-              }
-              onError={(message) => error("input-schema", message)}
-            />
-            <JsonEditor
-              label="Result selection (optional)"
-              value={workflow.result ?? null}
-              onChange={(value) => {
-                const next = workflowSchema.parse({
-                  ...workflow,
-                  result: value === null ? undefined : value,
-                });
-                update(next);
-              }}
-              onError={(message) => error("result", message)}
-            />
+            {!isAction(workflow) && (
+              <JsonEditor
+                label="Launch input schema"
+                value={workflow.inputSchema}
+                onChange={(value) =>
+                  update({
+                    ...workflow,
+                    expectedInput: undefined,
+                    inputSchema: schema.parse(value),
+                  })
+                }
+                onError={(message) => error("input-schema", message)}
+              />
+            )}
+            {addStage && (
+              <button
+                className="button"
+                disabled={blocked}
+                onClick={() => {
+                  addStage();
+                  close();
+                }}
+              >
+                <Plus size={14} />
+                Convert to workflow
+              </button>
+            )}
           </>
         ) : agent ? (
           <>
@@ -164,14 +177,12 @@ export function Inspector({
               key={`instructions-${stage?.id}/${agent.id}`}
               agent={agent}
               onChange={updateAgent}
+              workflowId={workflow.id}
             />
-            <AgentFolders
-              key={`${stage?.id}/${agent.id}`}
-              folders={agent.allowedFolders ?? []}
-              onChange={(allowedFolders) =>
-                updateAgent({ ...agent, allowedFolders })
-              }
-            />
+            <p className="muted">
+              All agents share the folders configured by STRAND_PATH_* in the
+              local environment. Use get_path to look up a named folder.
+            </p>
             <SkillPicker
               selected={agent.skills}
               skills={skills}
@@ -213,37 +224,12 @@ export function Inspector({
                 update={updateStage}
                 error={error}
               />
-              <label className="field">
-                Stage instructions
-                <textarea
-                  rows={5}
-                  value={stage.instructions}
-                  onChange={(event) =>
-                    updateStage({ ...stage, instructions: event.target.value })
-                  }
-                />
-              </label>
               <SkillPicker
                 selected={stage.skills}
                 skills={skills}
                 onChange={(ids) => updateStage({ ...stage, skills: ids })}
               />
-              <JsonEditor
-                label="Input bindings"
-                value={stage.inputs}
-                onChange={(value) =>
-                  updateStage(stageSchema.parse({ ...stage, inputs: value }))
-                }
-                onError={(message) => error(`bindings-${stage.id}`, message)}
-              />
-              <JsonEditor
-                label="Output schema"
-                value={stage.outputSchema}
-                onChange={(value) =>
-                  updateStage({ ...stage, outputSchema: schema.parse(value) })
-                }
-                onError={(message) => error(`output-${stage.id}`, message)}
-              />
+              <ExpectedOutput stage={stage} onChange={updateStage} />
               <button
                 className="button"
                 onClick={() =>

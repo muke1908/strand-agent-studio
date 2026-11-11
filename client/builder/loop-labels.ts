@@ -14,6 +14,7 @@ export const loopComparisonLabels: Record<
 };
 
 export function describeLoopCondition(loop: Loop): string {
+  if (loop.repeatWhen !== undefined) return loop.repeatWhen;
   const { pointer, operator, value } = loop.condition;
   const field = pointer ? pointer.slice(1) : "Entire output";
   return `${field} ${loopComparisonLabels[operator]} ${JSON.stringify(value)}`;

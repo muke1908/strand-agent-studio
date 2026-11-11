@@ -21,6 +21,7 @@ export function StageLoop({
   error: (key: string, message: string) => void;
 }) {
   const loop = stage.loop;
+  const natural = stage.expectedOutput !== undefined;
   const index = workflow.stages.findIndex((item) => item.id === stage.id);
   const fields = schemaFields(stage.outputSchema).map(([name, schema]) => ({
     name,
@@ -87,14 +88,19 @@ export function StageLoop({
                       value: true,
                     },
                     maxIterations: 3,
-                    feedback: {
-                      result: {
-                        source: "stage",
-                        stageId: stage.id,
-                        agentId: stage.agents[0].id,
-                        pointer: "",
-                      },
-                    },
+                    ...(natural
+                      ? { repeatWhen: "Changes or fixes are still needed." }
+                      : {}),
+                    feedback: natural
+                      ? {}
+                      : {
+                          result: {
+                            source: "stage",
+                            stageId: stage.id,
+                            agentId: stage.agents[0].id,
+                            pointer: "",
+                          },
+                        },
                   }
                 : undefined,
             });
@@ -140,207 +146,245 @@ export function StageLoop({
             </p>
           </div>
           <h3 className="loop-section-title">1. When should it repeat?</h3>
-          <label className="field">
-            Read output from
-            <select
-              value={loop.condition.agentId}
-              onChange={(event) => {
-                valueError("");
-                update({
-                  ...stage,
-                  loop: {
-                    ...loop,
-                    condition: {
-                      ...loop.condition,
-                      agentId: event.target.value,
-                    },
-                  },
-                });
-              }}
-            >
-              {stage.agents.map((agent) => (
-                <option key={agent.id} value={agent.id}>
-                  {agent.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="field">
-            Output field
-            <select
-              value={
-                !customField &&
-                fields.some((field) => field.pointer === loop.condition.pointer)
-                  ? loop.condition.pointer
-                  : "custom"
-              }
-              onChange={(event) => {
-                if (event.target.value === "custom") {
-                  setCustomField(true);
-                  return;
-                }
-                setCustomField(false);
-                const field = fields.find(
-                  (item) => item.pointer === event.target.value,
-                );
-                const numeric =
-                  field?.type === "number" || field?.type === "integer";
-                const value =
-                  numeric && typeof loop.condition.value !== "number"
-                    ? 0
-                    : field?.type === "boolean" &&
-                        typeof loop.condition.value !== "boolean"
-                      ? true
-                      : field?.type === "string" &&
-                          typeof loop.condition.value !== "string"
-                        ? ""
-                        : loop.condition.value;
-                valueError("");
-                setJsonMode(false);
-                update({
-                  ...stage,
-                  loop: {
-                    ...loop,
-                    condition: {
-                      ...loop.condition,
-                      pointer: event.target.value,
-                      value,
-                      operator:
-                        numeric ||
-                        ["equals", "notEquals"].includes(
-                          loop.condition.operator,
-                        )
-                          ? loop.condition.operator
-                          : "equals",
-                    },
-                  },
-                });
-              }}
-            >
-              {fields.map((field) => (
-                <option key={field.pointer} value={field.pointer}>
-                  {field.name}
-                </option>
-              ))}
-              <option value="custom">Custom field path...</option>
-            </select>
-          </label>
-          {(customField ||
-            !fields.some(
-              (field) => field.pointer === loop.condition.pointer,
-            )) && (
+          {natural ? (
             <label className="field">
-              Custom field path
-              <input
-                aria-label="Custom field path"
-                placeholder="/result/needsAnotherPass"
-                value={loop.condition.pointer}
-                onChange={(event) => {
-                  valueError("");
+              Repeat when
+              <textarea
+                rows={3}
+                maxLength={2000}
+                value={loop.repeatWhen ?? describeLoopCondition(loop)}
+                onChange={(event) =>
                   update({
                     ...stage,
                     loop: {
                       ...loop,
+                      repeatWhen: event.target.value,
                       condition: {
-                        ...loop.condition,
-                        pointer: event.target.value,
+                        agentId: loop.condition.agentId,
+                        pointer: "/needsAnotherPass",
+                        operator: "equals",
+                        value: true,
                       },
+                      feedback: {},
                     },
-                  });
-                }}
+                  })
+                }
               />
               <small>
-                Use /field or /nested/field. Leave empty to compare the entire
-                output.
+                Describe the reason to repeat in plain language. The agent
+                evaluates it from the actual result.
               </small>
             </label>
-          )}
-          <label className="field">
-            Comparison
-            <select
-              value={loop.condition.operator}
-              onChange={(event) => {
-                const operator = loopOperators.find(
-                  (value) => value === event.target.value,
-                );
-                if (operator) {
-                  const numeric =
-                    operator !== "equals" && operator !== "notEquals";
-                  valueError("");
-                  if (numeric) {
-                    setJsonMode(false);
-                  }
-                  update({
-                    ...stage,
-                    loop: {
-                      ...loop,
-                      condition: {
-                        ...loop.condition,
-                        operator,
-                        value:
-                          numeric && typeof loop.condition.value !== "number"
-                            ? 0
-                            : loop.condition.value,
-                      },
-                    },
-                  });
-                }
-              }}
-            >
-              {loopOperators.map((operator) => (
-                <option key={operator} value={operator}>
-                  {loopComparisonLabels[operator]}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="field">
-            Value type
-            <select
-              value={valueType}
-              onChange={(event) => {
-                const type = event.target.value;
-                setJsonMode(type === "json");
-                valueError("");
-                if (type !== "json")
-                  changeValue(
-                    type === "boolean" ? true : type === "number" ? 0 : "",
-                  );
-              }}
-            >
-              <option value="boolean">True / false</option>
-              <option value="number">Number</option>
-              <option value="string">Text</option>
-              <option value="json">JSON (advanced)</option>
-            </select>
-          </label>
-          {valueType === "boolean" ? (
-            <label className="field">
-              Comparison value
-              <select
-                value={String(loop.condition.value)}
-                onChange={(event) => changeValue(event.target.value === "true")}
-              >
-                <option value="true">True</option>
-                <option value="false">False</option>
-              </select>
-            </label>
-          ) : valueType === "number" || valueType === "string" ? (
-            <SimpleValue
-              key={`${valueType}-${loop.condition.agentId}-${loop.condition.pointer}-${loop.condition.operator}`}
-              value={loop.condition.value}
-              numeric={valueType === "number"}
-              onChange={changeValue}
-              onError={valueError}
-            />
           ) : (
-            <JsonEditor
-              key={`${loop.condition.agentId}-${loop.condition.pointer}-${loop.condition.operator}`}
-              label="Comparison value"
-              value={loop.condition.value}
-              onChange={(value) => changeValue(jsonValue.parse(value))}
-              onError={valueError}
-            />
+            <>
+              <label className="field">
+                Read output from
+                <select
+                  value={loop.condition.agentId}
+                  onChange={(event) => {
+                    valueError("");
+                    update({
+                      ...stage,
+                      loop: {
+                        ...loop,
+                        condition: {
+                          ...loop.condition,
+                          agentId: event.target.value,
+                        },
+                      },
+                    });
+                  }}
+                >
+                  {stage.agents.map((agent) => (
+                    <option key={agent.id} value={agent.id}>
+                      {agent.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                Output field
+                <select
+                  value={
+                    !customField &&
+                    fields.some(
+                      (field) => field.pointer === loop.condition.pointer,
+                    )
+                      ? loop.condition.pointer
+                      : "custom"
+                  }
+                  onChange={(event) => {
+                    if (event.target.value === "custom") {
+                      setCustomField(true);
+                      return;
+                    }
+                    setCustomField(false);
+                    const field = fields.find(
+                      (item) => item.pointer === event.target.value,
+                    );
+                    const numeric =
+                      field?.type === "number" || field?.type === "integer";
+                    const value =
+                      numeric && typeof loop.condition.value !== "number"
+                        ? 0
+                        : field?.type === "boolean" &&
+                            typeof loop.condition.value !== "boolean"
+                          ? true
+                          : field?.type === "string" &&
+                              typeof loop.condition.value !== "string"
+                            ? ""
+                            : loop.condition.value;
+                    valueError("");
+                    setJsonMode(false);
+                    update({
+                      ...stage,
+                      loop: {
+                        ...loop,
+                        condition: {
+                          ...loop.condition,
+                          pointer: event.target.value,
+                          value,
+                          operator:
+                            numeric ||
+                            ["equals", "notEquals"].includes(
+                              loop.condition.operator,
+                            )
+                              ? loop.condition.operator
+                              : "equals",
+                        },
+                      },
+                    });
+                  }}
+                >
+                  {fields.map((field) => (
+                    <option key={field.pointer} value={field.pointer}>
+                      {field.name}
+                    </option>
+                  ))}
+                  <option value="custom">Custom field path...</option>
+                </select>
+              </label>
+              {(customField ||
+                !fields.some(
+                  (field) => field.pointer === loop.condition.pointer,
+                )) && (
+                <label className="field">
+                  Custom field path
+                  <input
+                    aria-label="Custom field path"
+                    placeholder="/result/needsAnotherPass"
+                    value={loop.condition.pointer}
+                    onChange={(event) => {
+                      valueError("");
+                      update({
+                        ...stage,
+                        loop: {
+                          ...loop,
+                          condition: {
+                            ...loop.condition,
+                            pointer: event.target.value,
+                          },
+                        },
+                      });
+                    }}
+                  />
+                  <small>
+                    Use /field or /nested/field. Leave empty to compare the
+                    entire output.
+                  </small>
+                </label>
+              )}
+              <label className="field">
+                Comparison
+                <select
+                  value={loop.condition.operator}
+                  onChange={(event) => {
+                    const operator = loopOperators.find(
+                      (value) => value === event.target.value,
+                    );
+                    if (operator) {
+                      const numeric =
+                        operator !== "equals" && operator !== "notEquals";
+                      valueError("");
+                      if (numeric) {
+                        setJsonMode(false);
+                      }
+                      update({
+                        ...stage,
+                        loop: {
+                          ...loop,
+                          condition: {
+                            ...loop.condition,
+                            operator,
+                            value:
+                              numeric &&
+                              typeof loop.condition.value !== "number"
+                                ? 0
+                                : loop.condition.value,
+                          },
+                        },
+                      });
+                    }
+                  }}
+                >
+                  {loopOperators.map((operator) => (
+                    <option key={operator} value={operator}>
+                      {loopComparisonLabels[operator]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                Value type
+                <select
+                  value={valueType}
+                  onChange={(event) => {
+                    const type = event.target.value;
+                    setJsonMode(type === "json");
+                    valueError("");
+                    if (type !== "json")
+                      changeValue(
+                        type === "boolean" ? true : type === "number" ? 0 : "",
+                      );
+                  }}
+                >
+                  <option value="boolean">True / false</option>
+                  <option value="number">Number</option>
+                  <option value="string">Text</option>
+                  <option value="json">JSON (advanced)</option>
+                </select>
+              </label>
+              {valueType === "boolean" ? (
+                <label className="field">
+                  Comparison value
+                  <select
+                    value={String(loop.condition.value)}
+                    onChange={(event) =>
+                      changeValue(event.target.value === "true")
+                    }
+                  >
+                    <option value="true">True</option>
+                    <option value="false">False</option>
+                  </select>
+                </label>
+              ) : valueType === "number" || valueType === "string" ? (
+                <SimpleValue
+                  key={`${valueType}-${loop.condition.agentId}-${loop.condition.pointer}-${loop.condition.operator}`}
+                  value={loop.condition.value}
+                  numeric={valueType === "number"}
+                  onChange={changeValue}
+                  onError={valueError}
+                />
+              ) : (
+                <JsonEditor
+                  key={`${loop.condition.agentId}-${loop.condition.pointer}-${loop.condition.operator}`}
+                  label="Comparison value"
+                  value={loop.condition.value}
+                  onChange={(value) => changeValue(jsonValue.parse(value))}
+                  onError={valueError}
+                />
+              )}
+            </>
           )}
           <h3 className="loop-section-title">2. Where should it go back?</h3>
           <label className="field">
@@ -392,41 +436,47 @@ export function StageLoop({
           <div className="loop-feedback-summary">
             <strong>Feedback sent on repeat</strong>
             <span>
-              {Object.keys(loop.feedback).join(", ") ||
-                "No feedback configured"}
+              {natural
+                ? "The complete stage result is passed back automatically."
+                : Object.keys(loop.feedback).join(", ") ||
+                  "No feedback configured"}
             </span>
           </div>
-          <details className="loop-advanced">
-            <summary>Feedback &amp; advanced settings</summary>
-            <p className="muted">
-              Choose which accepted outputs are passed back. Existing mappings
-              are kept unless you edit them.
-            </p>
-            <JsonEditor
-              label="Loop feedback bindings"
-              value={loop.feedback}
-              onChange={(value) =>
-                update(
-                  stageSchema.parse({
-                    ...stage,
-                    loop: { ...loop, feedback: value },
-                  }),
-                )
-              }
-              onError={(message) => error(`loop-feedback-${stage.id}`, message)}
-            />
-            <p className="muted">
-              Agents receive feedback automatically; the first pass has none.
-              Input bindings can also use{" "}
-              {`{"source":"loop","pointer":"/feedback"}`}, with an optional
-              first-pass default.
-            </p>
-            <p className="muted">
-              Missing output or status &quot;blocked&quot; stops execution, not
-              another pass. Skipping this stage bypasses its loop. Loop ranges
-              cannot overlap or nest.
-            </p>
-          </details>
+          {!natural && (
+            <details className="loop-advanced">
+              <summary>Feedback &amp; advanced settings</summary>
+              <p className="muted">
+                Choose which accepted outputs are passed back. Existing mappings
+                are kept unless you edit them.
+              </p>
+              <JsonEditor
+                label="Loop feedback bindings"
+                value={loop.feedback}
+                onChange={(value) =>
+                  update(
+                    stageSchema.parse({
+                      ...stage,
+                      loop: { ...loop, feedback: value },
+                    }),
+                  )
+                }
+                onError={(message) =>
+                  error(`loop-feedback-${stage.id}`, message)
+                }
+              />
+              <p className="muted">
+                Agents receive feedback automatically; the first pass has none.
+                Input bindings can also use{" "}
+                {`{"source":"loop","pointer":"/feedback"}`}, with an optional
+                first-pass default.
+              </p>
+              <p className="muted">
+                Missing output or status &quot;blocked&quot; stops execution,
+                not another pass. Skipping this stage bypasses its loop. Loop
+                ranges cannot overlap or nest.
+              </p>
+            </details>
+          )}
         </>
       )}
     </fieldset>

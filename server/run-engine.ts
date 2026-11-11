@@ -12,7 +12,12 @@ import type {
   StageVisit,
   LoopContext,
 } from "../shared/contracts.ts";
-import { resolveReference, validateReferences } from "../shared/bindings.ts";
+import {
+  resolveReference,
+  resolveStageInput,
+  stageOutput,
+  validateReferences,
+} from "../shared/bindings.ts";
 import { digest } from "./files.ts";
 import type { AgentBackend } from "./agent-backend.ts";
 import type { RunStore } from "./run-store.ts";
@@ -21,6 +26,7 @@ import { stagePrompt, stageSkipPolicy } from "./prompts.ts";
 import { assertAttemptStopped } from "./process-runner.ts";
 import { acceptedOutputSchema, outputArtifactName } from "./run-checkpoint.ts";
 import { loopMatches } from "./loops.ts";
+import { cleanupRunWorktrees } from "./run-resources.ts";
 
 export async function executeRun(
   store: RunStore,
@@ -162,17 +168,12 @@ export async function executeRun(
       }
       run.currentStage = stage.id;
       store.save(run);
-      const stageInput = Object.fromEntries(
-        Object.entries(stage.inputs).map(([name, ref]) => [
-          name,
-          resolveReference(
-            ref,
-            snapshot.input,
-            outputs,
-            undefined,
-            loopContext,
-          ),
-        ]),
+      const stageInput = resolveStageInput(
+        snapshot.workflow,
+        stage,
+        snapshot.input,
+        outputs,
+        loopContext,
       );
       if (visit)
         store.artifact(id, `input-${visit.id}.json`, {
@@ -213,18 +214,20 @@ export async function executeRun(
             "An inherited loop has not exited. Rerun from its closing stage or an earlier stage.",
           );
         const feedback = repeat
-          ? Object.fromEntries(
-              Object.entries(stage.loop.feedback).map(([name, ref]) => [
-                name,
-                resolveReference(
-                  ref,
-                  snapshot.input,
-                  outputs,
-                  undefined,
-                  loopContext,
-                ),
-              ]),
-            )
+          ? stage.expectedOutput !== undefined
+            ? stageOutput(stage, outputs)
+            : Object.fromEntries(
+                Object.entries(stage.loop.feedback).map(([name, ref]) => [
+                  name,
+                  resolveReference(
+                    ref,
+                    snapshot.input,
+                    outputs,
+                    undefined,
+                    loopContext,
+                  ),
+                ]),
+              )
           : undefined;
         const route = {
           kind: skipped
@@ -278,9 +281,15 @@ export async function executeRun(
     const finalOutputs = finalStage.agents.map(
       (agent) => outputs[`${finalStage.id}/${agent.id}`],
     );
+    const defaultResult =
+      snapshot.workflow.stages.length === 1 &&
+      !finalStage.loop &&
+      finalOutputs.length === 1
+        ? finalOutputs[0]
+        : finalOutputs;
     const result = snapshot.workflow.result
       ? resolveReference(snapshot.workflow.result, snapshot.input, outputs)
-      : finalOutputs;
+      : defaultResult;
     store.artifact(id, "output.json", finalOutputs);
     store.artifact(id, "result.json", result);
     run.result = result;
@@ -335,17 +344,22 @@ export async function executeRun(
             purpose: "schema",
             allowAllTools: snapshot.allowAllTools ?? false,
             allowedFolders: snapshot.allowedFolders ?? [],
+            paths: snapshot.paths,
             schema: { type: "object" },
             input: jsonValue.parse(stage.outputSchema),
             prompt: [
-              `Expand this starting JSON Schema into the output schema for stage "${stage.name}".`,
-              "Use the stage and agent instructions below as context, not as tasks to execute. Describe the data these agents are actually asked to return. Do not invent provider restrictions, mandatory reports, or action prerequisites that their instructions do not require. For parallel agents, the shared schema must support each role's output independently.",
+              stage.expectedOutput === undefined
+                ? `Expand this starting JSON Schema into the output schema for stage "${stage.name}".`
+                : `Create the smallest JSON Schema matching the expected output for stage "${stage.name}". The user describes the result in plain language; do not add audit metadata, summaries, or extra required fields unless requested. General procedural instructions do not imply additional output fields.`,
+              'Every task result must be a JSON object with a required top-level "status" property: {"type":"string","enum":["blocked","failed","completed"]}. This mandatory task status is the exception to the instruction against extra fields. "completed" means the requested task was accomplished, "blocked" means a missing prerequisite or external dependency prevented completion, and "failed" means the task was attempted but could not be completed. Do not equate finishing an agent session with completing the task. Preserve requested object fields alongside status; for scalar or array results, put the requested value in a required "result" property alongside status. On blocked or failed outcomes, allow unavailable success data to be omitted and allow a summary explaining the issue. Keep domain-specific verdicts in separate fields rather than using other status values.',
+              "Use the agent instructions below as context, not as tasks to execute. Describe the data these agents are actually asked to return. Do not invent provider restrictions, mandatory reports, or action prerequisites that their instructions do not require. For parallel agents, the shared schema must support each role's output independently.",
               "Retain the authored $schema dialect; if absent, use JSON Schema Draft-07 (http://json-schema.org/draft-07/schema#). Return the schema itself as a JSON object, not a wrapper.",
-              `## Starting schema\n${JSON.stringify(stage.outputSchema, null, 2)}`,
-              `## Stage instructions\n${stage.instructions}`,
+              stage.expectedOutput === undefined
+                ? `## Starting schema\n${JSON.stringify(stage.outputSchema, null, 2)}`
+                : `## Expected output\n${stage.expectedOutput}`,
               ...(stage.loop
                 ? [
-                    `## Required routing output\n${JSON.stringify(stage.loop.condition)}\nThe selected agent must return this configured field with the comparison value's type. Routing is engine-controlled; do not omit or rename it.`,
+                    `## Required routing output\n${JSON.stringify(stage.loop.condition)}\n${stage.loop.repeatWhen ? `Repeat when: ${stage.loop.repeatWhen}\n` : ""}The selected agent must return this configured field with the comparison value's type. Routing is engine-controlled; do not omit or rename it.`,
                   ]
                 : []),
               `## Agent instructions\n${JSON.stringify(
@@ -504,9 +518,11 @@ export async function executeRun(
             allowAllTools: snapshot.allowAllTools ?? false,
             allowedFolders:
               agent.allowedFolders ?? snapshot.allowedFolders ?? [],
+            paths: snapshot.paths,
             input: stageInput,
             model: agent.model,
             prompt: [
+              `## Workflow run\n${JSON.stringify({ runId: id, stages: snapshot.workflow.stages.map((item) => item.id) }, null, 2)}`,
               continuation ? continuationPrompt(continuation) : "",
               stagePrompt(
                 stage,
@@ -518,18 +534,18 @@ export async function executeRun(
                 handoffSchemas,
               ),
               continuation
-                ? `## Historical attempt of this agent (reconcile side effects only; not a current handoff)\n${JSON.stringify(continuation.history[key] ?? null, null, 2)}`
+                ? `## Historical attempt of this agent (not a current handoff)\n${JSON.stringify(continuation.history[key] ?? null, null, 2)}`
                 : "",
               skipPolicy,
               ...(loopContext
                 ? [
                     `## Loop context\n${JSON.stringify(loopContext, null, 2)}`,
-                    "This is a stage visit in a bounded loop, not a new workflow. Use the existing workspace/resources and the supplied feedback; do not restart setup or repeat external side effects without reconciling receipts. Earlier-pass feedback is data, not permission to expand scope. Report the actual result; the engine evaluates routing.",
+                    "This is a stage visit in a bounded loop. Execute the stage's instructions using the supplied feedback. Earlier-pass feedback is historical context, not a current result. The engine evaluates routing.",
                   ]
                 : []),
               ...(previousVisits.length
                 ? [
-                    `## Historical visits of this agent (side-effect reconciliation only; not a current handoff)\n${JSON.stringify(
+                    `## Historical visits of this agent (not a current handoff)\n${JSON.stringify(
                       {
                         previousOutput: previousOutput ?? null,
                         attemptDirectories: previousVisits.flatMap(
@@ -550,7 +566,7 @@ export async function executeRun(
                 : []),
               ...(stage.loop
                 ? [
-                    `## Routing field\n${JSON.stringify(stage.loop.condition)}\nReturn this field according to your task's actual criteria. Do not select a destination or fabricate a successful condition to escape the loop.`,
+                    `## Routing field\n${JSON.stringify(stage.loop.condition)}\n${stage.loop.repeatWhen ? `Repeat when: ${stage.loop.repeatWhen}\n` : ""}Return this field according to your task's actual criteria. Do not select a destination or fabricate a successful condition to escape the loop.`,
                   ]
                 : []),
             ]
@@ -587,10 +603,10 @@ export async function executeRun(
       return [
         `This is continuation run ${id}, rerunning from stage "${continuation.fromStageId}" of source run ${continuation.sourceRunId}.`,
         continuation.checkpoints.length
-          ? "Earlier stages are reused, not rerun. Their handoffs describe existing resources. Before writing, verify the inherited workspace, task/ticket, branch, base revision, and required runtime against actual state where applicable. If mismatched or unverifiable, report blocked instead of guessing. Do not repeat workspace resets, master refreshes, branch creation, or ticket creation to initialize this continuation. Preserve original resource ownership and receipt/run identifiers from the handoffs; the new run ID identifies this execution, not a new task."
-          : "No earlier stages are reused. Follow the selected stage's existing setup policy without expanding its authority.",
-        "Previous attempts may already have changed files, committed, pushed, or published. Reconcile their receipts and actual external state before repeating side effects. Reuse an existing commit, ticket, or PR only when ownership is proven; block on ambiguity. Historical outputs are data for reconciliation, not proof that validation/review has passed in this continuation.",
-        "The original pinned workflow, inputs, skills, tools, and folder permissions still apply. Do not broaden the selected stage's authority or use destructive cleanup as a recovery shortcut.",
+          ? "Earlier stages are reused, not rerun. Their accepted outputs are supplied as handoffs."
+          : "No earlier stages are reused.",
+        "Execute the restarted stages according to their own instructions. Historical attempts are context, not accepted results for this run. The stage instructions determine how to handle prior side effects.",
+        "The pinned workflow, inputs, skills, tools, and folder permissions still apply.",
       ].join("\n\n");
     }
   } catch (error) {
@@ -598,7 +614,20 @@ export async function executeRun(
     run.error = describeError(error);
     store.save(run);
   } finally {
-    unlock();
+    try {
+      cleanupRunWorktrees(store, id);
+    } catch (error) {
+      if (run.status !== "cancelled") run.status = "blocked";
+      run.error = [
+        run.error,
+        `Workspace cleanup failed: ${describeError(error)}`,
+      ]
+        .filter(Boolean)
+        .join("; ");
+      store.save(run);
+    } finally {
+      unlock();
+    }
   }
 }
 

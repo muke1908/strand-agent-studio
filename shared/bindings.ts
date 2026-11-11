@@ -1,4 +1,10 @@
-import type { Json, LoopContext, Reference, Workflow } from "./contracts.ts";
+import type {
+  Json,
+  LoopContext,
+  Reference,
+  Stage,
+  Workflow,
+} from "./contracts.ts";
 
 export function pointer(value: Json, path: string): Json {
   if (path === "") return value;
@@ -53,6 +59,49 @@ export function resolveReference(
   return pointer(outputs[key], ref.pointer);
 }
 
+export function stageOutput(stage: Stage, outputs: Record<string, Json>): Json {
+  const results = Object.fromEntries(
+    stage.agents.map((agent) => [
+      agent.id,
+      resolveReference(
+        { source: "stage", stageId: stage.id, agentId: agent.id, pointer: "" },
+        null,
+        outputs,
+      ),
+    ]),
+  );
+  return stage.agents.length === 1 ? results[stage.agents[0].id] : results;
+}
+
+export function resolveStageInput(
+  workflow: Workflow,
+  stage: Stage,
+  input: Json,
+  outputs: Record<string, Json>,
+  loopContext?: LoopContext,
+): Json {
+  if (stage.expectedOutput !== undefined) {
+    if (
+      loopContext &&
+      loopContext.iteration > 1 &&
+      workflow.stages.find((item) => item.id === loopContext.stageId)?.loop
+        ?.targetStageId === stage.id
+    )
+      return loopContext.feedback;
+    const index = workflow.stages.findIndex((item) => item.id === stage.id);
+    if (index < 0) throw new Error(`Unknown stage: ${stage.id}`);
+    return index === 0
+      ? input
+      : stageOutput(workflow.stages[index - 1], outputs);
+  }
+  return Object.fromEntries(
+    Object.entries(stage.inputs).map(([name, ref]) => [
+      name,
+      resolveReference(ref, input, outputs, undefined, loopContext),
+    ]),
+  );
+}
+
 export function validateReferences(workflow: Workflow): void {
   const ranges = workflow.stages.flatMap((stage, end) => {
     if (!stage.loop) return [];
@@ -91,8 +140,9 @@ export function validateReferences(workflow: Workflow): void {
     const inLoop = ranges.some(
       ({ start, end }) => start <= index && index <= end,
     );
-    for (const ref of Object.values(stage.inputs))
-      validate(ref, available, inLoop);
+    if (stage.expectedOutput === undefined)
+      for (const ref of Object.values(stage.inputs))
+        validate(ref, available, inLoop);
     const agents = new Set<string>();
     for (const agent of stage.agents) {
       if (agents.has(agent.id))
@@ -101,8 +151,9 @@ export function validateReferences(workflow: Workflow): void {
     }
     available.add(`stage:${stage.id}`);
     for (const agent of stage.agents) available.add(`${stage.id}/${agent.id}`);
-    for (const ref of Object.values(stage.loop?.feedback ?? {}))
-      validate(ref, available, inLoop);
+    if (stage.expectedOutput === undefined)
+      for (const ref of Object.values(stage.loop?.feedback ?? {}))
+        validate(ref, available, inLoop);
   }
   if (workflow.result) validate(workflow.result, available);
 }

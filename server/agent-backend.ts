@@ -1,19 +1,23 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import type { Json, Schema } from "../shared/contracts.ts";
 import { executeProcess } from "./process-runner.ts";
+import type { NamedPaths } from "./path-config.ts";
 
 export type AgentRequest = {
   directory: string;
   prompt: string;
   schema: Schema;
-  purpose: "schema" | "stage" | "summary" | "watch-condition";
+  purpose:
+    "schema" | "stage" | "summary" | "watch-condition" | "watch-schedule";
   input: Json;
   model?: string;
   allowAllTools?: boolean;
   allowedFolders?: string[];
+  paths?: NamedPaths;
 };
 export interface AgentBackend {
   id: string;
@@ -119,6 +123,16 @@ export function copilotBackend(): AgentBackend {
           "Installed Copilot CLI does not support --allow-all-urls.",
         );
       fs.mkdirSync(request.directory, { recursive: true });
+      const pathTools = request.paths && Object.keys(request.paths).length > 0;
+      if (pathTools && !options.has("--additional-mcp-config"))
+        throw new Error(
+          "Installed Copilot CLI cannot expose the configured get_path tool (--additional-mcp-config missing).",
+        );
+      const pathsFile = path.join(request.directory, "paths.json");
+      if (pathTools)
+        fs.writeFileSync(pathsFile, JSON.stringify(request.paths), {
+          mode: 0o600,
+        });
       const promptFile = path.join(request.directory, "prompt.md");
       const outputFile = path.join(request.directory, "output.json");
       const allowedFolders = request.allowedFolders ?? [];
@@ -135,9 +149,17 @@ export function copilotBackend(): AgentBackend {
         [
           "## Required output artifact",
           `Output file: ${outputFile}`,
-          "Before finishing, write your result to this exact file as JSON matching the schema below. For blocked tasks, still write a schema-compliant result using only supported fields and status values.",
+          "Before finishing, write your successful result to this exact file as JSON matching the schema below.",
+          request.purpose === "stage"
+            ? 'Report the actual task outcome, not just whether your session finished: "completed" when the requested task was accomplished, "blocked" when a prerequisite or external dependency prevented completion, or "failed" when the task was attempted but could not be completed. For blocked or failed tasks, use the corresponding schema-supported shape; otherwise write {"status":"blocked","summary":"<specific actionable error>"} or {"status":"failed","summary":"<specific actionable error>"} as a runtime failure envelope, even when the success schema is a primitive. Both stop the run without publishing a successful result. Never fabricate a schema-compliant success, including 0, to represent failure.'
+            : "For blocked tasks, still write a schema-compliant result using only supported fields and status values.",
           "A final chat response or a separate audit receipt does not satisfy this contract.",
           `${folderInstructions}${restrictions}`,
+          ...(pathTools
+            ? [
+                `## Named paths\nUse the strand-paths get_path tool to resolve named paths before working with them. Available names: ${Object.keys(request.paths!).join(", ")}. These values are pinned for this run. Do not read .env or assume shell environment variables contain these names.`,
+              ]
+            : []),
           `## Required output schema\n${JSON.stringify(request.schema, null, 2)}`,
           `## Task\n${request.prompt}`,
         ].join("\n\n"),
@@ -160,9 +182,41 @@ export function copilotBackend(): AgentBackend {
         "--add-dir",
         request.directory,
         ...allowedFolders.flatMap((folder) => ["--add-dir", folder]),
+        ...(pathTools
+          ? [
+              "--additional-mcp-config",
+              JSON.stringify({
+                mcpServers: {
+                  "strand-paths": {
+                    type: "local",
+                    command: process.execPath,
+                    args: [
+                      fileURLToPath(
+                        new URL(
+                          import.meta.url.endsWith(".js")
+                            ? "./path-tool.js"
+                            : "./path-tool.ts",
+                          import.meta.url,
+                        ),
+                      ),
+                      pathsFile,
+                    ],
+                    tools: ["get_path"],
+                  },
+                },
+              }),
+            ]
+          : []),
         ...(request.allowAllTools
           ? ["--allow-all-urls"]
-          : ["--available-tools", "view", "create", "edit", "apply_patch"]),
+          : [
+              "--available-tools",
+              "view",
+              "create",
+              "edit",
+              "apply_patch",
+              ...(pathTools ? ["strand-paths"] : []),
+            ]),
         "--allow-all-tools",
         "--log-dir",
         path.join(request.directory, "cli-logs"),

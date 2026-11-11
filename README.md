@@ -44,6 +44,8 @@ Edit `.env` to point to existing directories on this machine. Remove example `ST
 npm run workflows:refresh
 ```
 
+Repository workflows can describe launch inputs with `expectedInput` alone; `inputSchema` is not required in exported files. Import compiles the description using the same restricted compiler as the editor and stores the schema locally for launch-form validation. An empty description explicitly means no inputs. Legacy exports with an authored `inputSchema` remain supported. Unchanged imported descriptions reuse their compiled schemas on refresh; compilation errors fail the import explicitly before saving definitions.
+
 Refresh refuses conflicting local builder edits and does not delete local workflows missing from the export. Changes to exported files must have matching SHA-256 entries in `export.json`; changing a file alone is not a valid refreshed export.
 
 Link an agent's Markdown instructions with the builder's file picker. With a workflow repository configured, the picker starts in that workflow's directory and saves `instructionsFile` relative to `workflows/<id>/workflow.json`, for example `mds/implement.md`. Relative files must stay inside that directory, including after symlink resolution. Missing files fail explicitly. Absolute links remain readable for historical/local workflows. Instructions are resolved and pinned when a run is admitted; editing the linked file does not change an existing run's snapshot.
@@ -57,6 +59,45 @@ Workflow string values, including JSON schema constants, can use `${STRAND_PATH_
 Install and authenticate the GitHub Copilot CLI before running real agents. If it is not on your PATH, set `COPILOT_BIN` to its executable or JavaScript entry point. All Copilot calls default to `gpt-6-astra`, including workflow agents, schema generation, result summaries and watch-condition compilation; an explicit agent model overrides this default. Settings reports backend availability; unavailable execution fails explicitly rather than fabricating results.
 
 The launcher checks the bundled CLI with auto-update disabled, just as it executes it. Optional folder-trust and client-telemetry flags are used only when supported; older versions disable history export with `--no-remote-export`. If client telemetry cannot be disabled, diagnostics and server logs report that limitation. Missing required execution or history controls block execution.
+
+### Set up a Dev Box
+
+On a Windows Dev Box, run Strand inside **WSL2/Linux**, not native Windows: process supervision and workflow helpers require POSIX tools. Install Node.js 24.13+, Git, GitHub CLI and GitHub Copilot CLI in that same environment. Authenticate GitHub CLI with an account that can clone the private workflow repository, and authenticate Copilot separately with `copilot login`.
+
+```sh
+mkdir -p "$HOME/src" "$HOME/.local/share/strand/workflows" "$HOME/.local/share/strand/output"
+cd "$HOME/src"
+gh repo clone muke1908/strand-agent-studio
+gh repo clone mukeshbiswas_microsoft/strand-workflows
+cd strand-agent-studio
+npm ci
+cp .env.example .env
+```
+
+Edit `.env` using **absolute paths on the Dev Box**, not paths from another machine:
+
+```dotenv
+STRAND_WORKFLOWS_DIR=/home/YOUR_USER/src/strand-workflows
+STRAND_PATH_TSCALLING_WORKSPACE=/absolute/path/to/your/existing/TsCalling/checkout
+STRAND_PATH_WORKFLOW_DATA=/home/YOUR_USER/.local/share/strand/workflows
+STRAND_PATH_STUDIO_OUT=/home/YOUR_USER/.local/share/strand/output
+STRAND_PATH_NODE_BIN=/absolute/path/to/the/directory/containing/node
+```
+
+Replace every placeholder; Node's env-file loader does not expand `$HOME` in these values. Find `NODE_BIN` with `node -p "require('node:path').dirname(process.execPath)"`. Prepare the existing TsCalling/Orient workspace separately; Strand does not provision it. Every configured directory must already exist and be accessible from the same Linux environment. If `copilot` is not on the host's PATH, also set `COPILOT_BIN` to its executable or JavaScript entry point.
+
+```sh
+npm run build
+npm start
+```
+
+Open **http://localhost:4200** on the Dev Box. On a fresh data directory, startup verifies and imports the workflow export, then compiles launch schemas using authenticated Copilot. This may take time and requires access to the configured default model (`gpt-6-astra`). It does not launch workflows or register watches. For access from another machine, use an SSH tunnel or the Dev Box's port forwarding; keep the API bound to loopback.
+
+Operational workflows also need their external tools on this machine: authenticated Azure CLI with the `azure-devops` extension and Git access for TsCalling; Orient for feature development; and any MCP servers referenced by the chosen workflow. Configure and authenticate those locally rather than copying tokens or CLI caches. Teams publication additionally requires the private local configuration described in the workflow repository's README. Start a first PR review with `publishToTeams=false` and `publishPrReview=false`; enable **Allow all tools** for its source-reading commands. Enable publication only after verifying the destination and permissions.
+
+Git does **not** transfer `.env`, `.data`, credentials, MCP configuration, workflow runtime state, watches or run history. The Dev Box imports the committed workflow definitions, not unsaved/local builder edits from another host. Keep each machine's runtime state separate; do not point two hosts at the same live data directory.
+
+For later updates, stop Strand, pull both repositories with `git pull --ff-only`, run `npm ci` and `npm run build` in the Studio checkout, then run `npm run workflows:refresh` before restarting. Refresh protects conflicting local builder edits; resolve them explicitly rather than deleting the data directory.
 
 ## A quick tour
 

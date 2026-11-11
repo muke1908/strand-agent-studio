@@ -6,6 +6,7 @@ test("existing result summaries generate on request, expose retry errors and kee
 }) => {
   const run: RunDetails = {
     id: "run-existing-result-summary",
+    kind: "workflow",
     workflowId: "summary",
     workflowName: "Existing summary",
     status: "completed",
@@ -160,6 +161,7 @@ test("contract progress is non-interactive and failures stay visible without ope
   };
   const run: RunDetails = {
     id: "run-contract-progress",
+    kind: "action",
     workflowId: "contract-progress",
     workflowName: "Contract progress",
     status: "running",
@@ -227,6 +229,7 @@ test("all pinned stages show execution styling separately from reported outcomes
   });
   const run: RunDetails = {
     id: "run-stage-progress",
+    kind: "workflow",
     workflowId: "stage-progress",
     workflowName: "Stage progress",
     status: "running",
@@ -288,6 +291,9 @@ test("all pinned stages show execution styling separately from reported outcomes
   ).toContainText("ready");
   await expect(inspect).toHaveClass(/stage-running/);
   await expect(inspect).toHaveAttribute("aria-busy", "true");
+  await expect(
+    inspect.getByRole("button", { name: "Re-run from Inspect" }),
+  ).toBeEnabled();
   await expect
     .poll(() =>
       inspect.evaluate(
@@ -301,7 +307,7 @@ test("all pinned stages show execution styling separately from reported outcomes
   ).toBeVisible();
   await expect(publish.getByRole("button", { name: /^View / })).toHaveCount(0);
   await expect(
-    publish.getByRole("button", { name: "Rerun from Publish" }),
+    publish.getByRole("button", { name: "Re-run from Publish" }),
   ).toBeDisabled();
   await expect(page.locator(".page-header .status")).toHaveCount(0);
   await page.emulateMedia({ reducedMotion: "reduce" });
@@ -562,7 +568,7 @@ test("Skip confirms an explicit owner override, retries safely, and continues wi
     page.getByRole("button", { name: "View Tester input and output" }),
   ).toContainText("0 attempts");
   await expect(
-    page.getByRole("button", { name: "Rerun from Review" }),
+    page.getByRole("button", { name: "Re-run from Review" }),
   ).toBeEnabled();
   expect(requests).toHaveLength(2);
   expect(requests[1]).toEqual(requests[0]);
@@ -584,7 +590,7 @@ test("Skip confirms an explicit owner override, retries safely, and continues wi
   ).toHaveClass(/stage-skipped/);
 });
 
-test("stage rerun icons confirm, surface errors, retry idempotently and open a continuation", async ({
+test("stage re-run confirms, surfaces errors, retries idempotently and opens a continuation", async ({
   page,
 }) => {
   const workflowId = `stage-rerun-icons-${crypto.randomUUID()}`;
@@ -632,14 +638,29 @@ test("stage rerun icons confirm, surface errors, retry idempotently and open a c
   expect(launched.ok()).toBe(true);
   const source = await launched.json();
   await page.goto(`/runs/${source.id}`);
-  const icon = page.getByRole("button", { name: "Rerun from Inspect" });
+  const icon = page.getByRole("button", { name: "Re-run from Inspect" });
   await expect(icon).toBeEnabled();
-  await expect(icon).toHaveText("");
-  await expect(icon).toHaveAttribute("title", "Rerun from Inspect");
+  await expect(icon).toHaveText("Re-run");
+  await expect(icon).toHaveAttribute("title", "Re-run from Inspect");
+  await expect(
+    page.getByRole("button", { name: /^Restart from / }),
+  ).toHaveCount(0);
+  await expect
+    .poll(async () => {
+      const current = await (
+        await page.request.get(`/api/pipeline-runs/${source.id}`)
+      ).json();
+      return [current.status, current.resultSummary?.status];
+    })
+    .toEqual(["completed", "completed"]);
   const before = await (
     await page.request.get(`/api/pipeline-runs/${source.id}`)
   ).json();
-  const requests: { stageId: string; requestId: string }[] = [];
+  const requests: {
+    stageId: string;
+    requestId: string;
+    latestInstructions: boolean;
+  }[] = [];
   await page.route(`**/api/pipeline-runs/${source.id}/rerun`, async (route) => {
     requests.push(route.request().postDataJSON());
     if (requests.length === 1)
@@ -675,6 +696,7 @@ test("stage rerun icons confirm, surface errors, retry idempotently and open a c
   expect(requests).toHaveLength(2);
   expect(requests[1]).toEqual(requests[0]);
   expect(requests[0].stageId).toBe("inspect");
+  expect(requests[0].latestInstructions).toBe(true);
   await expect(
     page.getByRole("link", { name: "an earlier run" }),
   ).toHaveAttribute("href", `/runs/${source.id}`);

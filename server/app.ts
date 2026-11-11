@@ -10,7 +10,13 @@ import {
   watchSchema,
   watchRegistrationSchema,
 } from "../shared/contracts.ts";
-import type { RunDetails, WatchDashboardItem } from "../shared/contracts.ts";
+import type {
+  Run,
+  RunDetails,
+  RunSummary,
+  WatchDashboardItem,
+} from "../shared/contracts.ts";
+import { isAction } from "../shared/workflow-kind.ts";
 import type { Catalog } from "./catalog.ts";
 import type { RunHost } from "./run-host.ts";
 import type { Watcher } from "./watcher.ts";
@@ -18,6 +24,7 @@ import type { AgentBackend } from "./agent-backend.ts";
 import { unitDetails } from "./unit-details.ts";
 import { instructionDirectory } from "./instruction-files.ts";
 import { runAssets } from "./run-assets.ts";
+import { workflowDirectory } from "./path-config.ts";
 
 export function createApp(
   catalog: Catalog,
@@ -54,6 +61,7 @@ export function createApp(
         "Restricted file tools by default. Allow all tools at launch to enable web, shell and MCP tools with automatic tool and URL approval.",
       storage:
         "Filesystem snapshots, immutable outputs, durable watch decisions.",
+      paths: catalog.config.paths,
     }),
   );
   app.get("/api/pipelines", (_request, response) =>
@@ -67,12 +75,26 @@ export function createApp(
       .refine((value) => !value.includes("\0"))
       .optional()
       .parse(request.query.directory);
-    response.json(instructionDirectory(directory));
+    const workflowId = identifier.optional().parse(request.query.workflowId);
+    const base = workflowId
+      ? workflowDirectory(catalog.config, workflowId)
+      : undefined;
+    response.json(
+      instructionDirectory(
+        directory
+          ? path.isAbsolute(directory)
+            ? directory
+            : base
+              ? path.resolve(base, directory)
+              : directory
+          : base,
+      ),
+    );
   });
   app.get("/api/pipelines/:id", (request, response) =>
     response.json(catalog.workflow(request.params.id)),
   );
-  app.put("/api/pipelines/:id", (request, response) => {
+  app.put("/api/pipelines/:id", async (request, response) => {
     const body = z
       .object({ value: workflowSchema, revision: z.string().optional() })
       .parse(request.body);
@@ -80,6 +102,16 @@ export function createApp(
       throw Object.assign(new Error("Workflow identity cannot change"), {
         status: 400,
       });
+    if (body.value.expectedInput !== undefined) {
+      const previous = catalog
+        .workflows()
+        .find(({ value }) => value.id === body.value.id);
+      if (previous?.value.expectedInput !== body.value.expectedInput)
+        body.value.inputSchema = await host.compileInputSchema(
+          body.value.expectedInput,
+          body.value.inputSchema,
+        );
+    }
     response.json(catalog.saveWorkflow(body.value, body.revision));
   });
   app.delete("/api/pipelines/:id", (request, response) => {
@@ -124,8 +156,28 @@ export function createApp(
         ),
       );
   });
+  function runSummary(run: Run): RunSummary {
+    return {
+      ...run,
+      kind: isAction(host.store.snapshot(run.id).workflow)
+        ? "action"
+        : "workflow",
+    };
+  }
   app.get("/api/pipeline-runs", (_request, response) =>
-    response.json(host.store.list()),
+    response.json(host.store.history().map(runSummary)),
+  );
+  app.delete("/api/pipeline-runs/:id", (request, response) => {
+    host.deleteRunHistory(request.params.id);
+    response.json({ deleted: true });
+  });
+  app.delete("/api/pipelines/:id/run-history", (request, response) =>
+    response.json({
+      deleted: host.deleteWorkflowHistory(
+        identifier.parse(request.params.id),
+        z.enum(["action", "workflow"]).optional().parse(request.query.kind),
+      ),
+    }),
   );
   app.get("/api/queue", (_request, response) =>
     response.json(host.queueState()),
@@ -133,7 +185,7 @@ export function createApp(
   app.get("/api/pipeline-runs/:id", (request, response) => {
     host.store.verify(request.params.id);
     const run: RunDetails = {
-      ...host.store.get(request.params.id),
+      ...runSummary(host.store.get(request.params.id)),
       resultSummary: host.summaries.read(request.params.id),
       stages: host.store
         .snapshot(request.params.id)
@@ -163,23 +215,22 @@ export function createApp(
   app.post("/api/pipeline-runs/:id/resume", (request, response) =>
     response.json(host.resume(request.params.id)),
   );
-  app.post("/api/pipeline-runs/:id/rerun", (request, response) => {
+  app.post("/api/pipeline-runs/:id/rerun", async (request, response) => {
     const body = z
       .object({
         stageId: identifier,
         requestId: z.string().min(1).max(160),
-        latestInstructions: z.boolean().optional(),
+        latestInstructions: z.boolean().default(false),
       })
       .strict()
       .parse(request.body);
     response
       .status(202)
       .json(
-        host.rerun(
+        await host.rerunStage(
           request.params.id,
           body.stageId,
           body.requestId,
-          undefined,
           body.latestInstructions,
         ),
       );
@@ -287,6 +338,29 @@ export function createApp(
       throw Object.assign(new Error("Watch identity cannot change"), {
         status: 400,
       });
+    if (
+      body.value.policyId === "schedule-cron" &&
+      typeof body.value.settings.schedule === "string"
+    ) {
+      const schedule = body.value.settings.schedule;
+      const previous = catalog
+        .watches()
+        .find((item) => item.value.id === body.value.id)?.value;
+      const timeZone = z.string().parse(body.value.settings.timeZone ?? "UTC");
+      const unchanged =
+        previous?.policyId === body.value.policyId &&
+        previous.settings.schedule === body.value.settings.schedule &&
+        (previous.settings.timeZone ?? "UTC") === timeZone;
+      const settings = { ...body.value.settings };
+      delete settings.compiled;
+      if (unchanged) {
+        if (previous.settings.compiled !== undefined)
+          settings.compiled = previous.settings.compiled;
+      } else {
+        settings.compiled = await host.compileWatchSchedule(schedule, timeZone);
+      }
+      body.value.settings = settings;
+    }
     const action = body.value.action;
     if (action && !("conditions" in action)) {
       if (
@@ -306,12 +380,35 @@ export function createApp(
           ? await host.compileWatchAction(
               body.value.workflowId,
               action,
-              body.value.inputBindings,
+              typeof body.value.input === "string"
+                ? body.value.input
+                : body.value.input === undefined
+                  ? body.value.inputBindings
+                  : Object.fromEntries(
+                      Object.entries(
+                        body.value.input !== null &&
+                          typeof body.value.input === "object" &&
+                          !Array.isArray(body.value.input)
+                          ? body.value.input
+                          : {},
+                      ).map(([name, value]) => [
+                        name,
+                        { source: "literal" as const, value },
+                      ]),
+                    ),
             )
           : action,
     });
     watcher.validate(value);
     response.json(catalog.saveWatch(value, body.revision));
+  });
+  app.delete("/api/pipeline-watches/:id", (request, response) => {
+    const body = z
+      .object({ revision: z.string().min(1).max(160) })
+      .strict()
+      .parse(request.body);
+    catalog.deleteWatch(request.params.id, body.revision);
+    response.json({ deleted: true });
   });
   app.use("/api", (_request, response) =>
     response.status(404).json({ error: "API endpoint not found" }),

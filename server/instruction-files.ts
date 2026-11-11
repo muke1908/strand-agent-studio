@@ -36,16 +36,52 @@ export function readInstructionFile(file: string): string {
   }
 }
 
-export function resolveWorkflowInstructions(workflow: Workflow): Workflow {
+function resolvedInstructionFile(file: string, directory?: string): string {
+  if (path.isAbsolute(file)) return file;
+  try {
+    if (!directory)
+      throw new Error(
+        "Relative instructions files require STRAND_WORKFLOWS_DIR.",
+      );
+    const base = fs.realpathSync(directory);
+    const resolved = fs.realpathSync(path.resolve(base, file));
+    const relative = path.relative(base, resolved);
+    if (
+      relative === ".." ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative)
+    )
+      throw new Error(
+        `Instructions file escapes its workflow directory: ${file}`,
+      );
+    return resolved;
+  } catch (error) {
+    throw fileError("Cannot resolve instructions file", file, error);
+  }
+}
+
+export function resolveWorkflowInstructions(
+  workflow: Workflow,
+  directory?: string,
+): Workflow {
   return {
     ...workflow,
     stages: workflow.stages.map((stage) => ({
       ...stage,
       agents: stage.agents.map((agent) => ({
         ...agent,
-        instructions: agent.instructionsFile
-          ? readInstructionFile(agent.instructionsFile)
-          : agent.instructions,
+        ...(agent.instructionsFile
+          ? (() => {
+              const file = resolvedInstructionFile(
+                agent.instructionsFile,
+                directory,
+              );
+              return {
+                instructionsFile: file,
+                instructions: readInstructionFile(file),
+              };
+            })()
+          : {}),
       })),
     })),
   };

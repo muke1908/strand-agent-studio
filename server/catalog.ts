@@ -17,9 +17,14 @@ import {
 } from "./files.ts";
 import { validateWorkflow } from "./validation.ts";
 import { resolveWorkflowFolders } from "./allowed-folders.ts";
-import { resolveWorkflowInstructions } from "./instruction-files.ts";
+import {
+  pathConfig,
+  runtimeWorkflow,
+  relativeInstructionFile,
+} from "./path-config.ts";
+import type { PathConfig } from "./path-config.ts";
 
-export function createCatalog(root: string) {
+export function createCatalog(root: string, config: PathConfig = pathConfig()) {
   privateDirectory(root);
   const workflowHistory = path.join(root, "workflow-history.json");
   function list<T>(collection: string, contract: ZodType<T>): Saved<T>[] {
@@ -69,6 +74,8 @@ export function createCatalog(root: string) {
     }
   }
   return {
+    config,
+    runtimeWorkflow: (workflow: Workflow) => runtimeWorkflow(workflow, config),
     workflows: () => list("workflows", workflowSchema),
     workflow: (id: string) => get("workflows", id, workflowSchema),
     hasWorkflowHistory: () => fs.existsSync(workflowHistory),
@@ -76,18 +83,33 @@ export function createCatalog(root: string) {
     watches: () => list("watches", watchSchema),
     watch: (id: string) => get("watches", id, watchSchema),
     saveWorkflow(value: Workflow, revision?: string) {
-      const parsed = resolveWorkflowFolders(workflowSchema.parse(value));
-      resolveWorkflowInstructions(parsed);
+      const parsed = workflowSchema.parse(value);
+      if (config.repository)
+        for (const stage of parsed.stages)
+          for (const agent of stage.agents) {
+            if (agent.instructionsFile)
+              agent.instructionsFile = relativeInstructionFile(
+                config,
+                parsed.id,
+                agent.instructionsFile,
+              );
+            delete agent.allowedFolders;
+          }
+      if (Object.keys(config.paths).length)
+        for (const stage of parsed.stages)
+          for (const agent of stage.agents) delete agent.allowedFolders;
+      const normalized = resolveWorkflowFolders(parsed);
+      const resolved = runtimeWorkflow(normalized, config);
       const skills = list("skills", skillSchema).map((item) => item.value);
       try {
-        validateWorkflow(parsed, skills);
+        validateWorkflow(resolved, skills);
       } catch (error) {
         throw Object.assign(
           error instanceof Error ? error : new Error(String(error)),
           { status: 400 },
         );
       }
-      return save("workflows", parsed, revision);
+      return save("workflows", normalized, revision);
     },
     deleteWorkflow(id: string, revision: string): void {
       const unlock = claim(itemPath(root, "claims", `workflows-${id}`));
@@ -120,6 +142,27 @@ export function createCatalog(root: string) {
     },
     saveSkill: (value: Skill, revision?: string) =>
       save("skills", skillSchema.parse(value), revision),
+    deleteWatch(id: string, revision: string): void {
+      const release = claim(itemPath(root, "watch-claims", id));
+      try {
+        const unlock = claim(itemPath(root, "claims", `watches-${id}`));
+        try {
+          const current = get("watches", id, watchSchema);
+          if (current.revision !== revision)
+            throw Object.assign(
+              new Error("This watch changed. Reload before deleting."),
+              { status: 409 },
+            );
+          fs.unlinkSync(itemPath(root, "watches", id));
+          const state = itemPath(root, "watch-state", id);
+          if (fs.existsSync(state)) fs.unlinkSync(state);
+        } finally {
+          unlock();
+        }
+      } finally {
+        release();
+      }
+    },
     saveWatch(value: Watch, revision?: string) {
       const parsed = watchSchema.parse(value);
       const previous = list("watches", watchSchema).find(
@@ -128,14 +171,15 @@ export function createCatalog(root: string) {
       const source = (watch: Watch) => ({
         workflowId: watch.workflowId,
         policyId: watch.policyId,
-        settings: watch.settings,
+        settings: watch.policyId === "schedule-cron" ? null : watch.settings,
+        input: watch.input,
         inputBindings: watch.inputBindings,
         action: watch.action ?? null,
       });
       if (previous && digest(source(previous)) !== digest(source(parsed)))
         throw Object.assign(
           new Error(
-            "Create a new watch to change its source, workflow or input bindings.",
+            "Create a new watch to change its source, workflow or input.",
           ),
           { status: 409 },
         );
