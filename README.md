@@ -6,7 +6,7 @@ TypeScript throughout; Node.js, Express, React and React Flow.
 
 ## Start
 
-Requires Node.js **24.13 or later** and macOS/Linux for process supervision.
+Requires Node.js **24.13 or later** on macOS, Linux, or native Windows 10/11.
 
 ```sh
 git clone https://github.com/muke1908/strand-agent-studio.git
@@ -36,6 +36,8 @@ Clone your workflow repository separately, then:
 cp .env.example .env
 ```
 
+Run `npm ci` in the workflow checkout too if it declares helper dependencies.
+
 Edit `.env` to point to existing directories on this machine. Remove example `STRAND_PATH_*` entries you do not need; configured directories must exist. `.env` is ignored by Git. `npm start`, `npm run dev`, and the refresh command load it; existing process environment variables take precedence.
 
 `STRAND_WORKFLOWS_DIR` points to the workflow checkout containing `export.json`, `workflows/<id>/workflow.json`, and the exported skills/instruction files. An empty workflow catalog imports checksum-verified definitions before seeding starters, without starting runs or watches. Existing catalogs are left unchanged. To explicitly import repository changes:
@@ -62,29 +64,33 @@ The launcher checks the bundled CLI with auto-update disabled, just as it execut
 
 ### Set up a Dev Box
 
-On a Windows Dev Box, run Strand inside **WSL2/Linux**, not native Windows: process supervision and workflow helpers require POSIX tools. Install Node.js 24.13+, Git, GitHub CLI and GitHub Copilot CLI in that same environment. Authenticate GitHub CLI with an account that can clone the private workflow repository, and authenticate Copilot separately with `copilot login`.
+Run Strand **natively on Windows; WSL is not required**. Install Node.js 24.13+, Git for Windows, GitHub CLI and GitHub Copilot CLI on the Windows host. Authenticate GitHub CLI with an account that can clone the private workflow repository, and authenticate Copilot separately with `copilot login`. Use PowerShell:
 
-```sh
-mkdir -p "$HOME/src" "$HOME/.local/share/strand/workflows" "$HOME/.local/share/strand/output"
-cd "$HOME/src"
+```powershell
+New-Item -ItemType Directory -Force "$HOME/src", "$HOME/strand-data/workflows", "$HOME/strand-data/output"
+Set-Location "$HOME/src"
 gh repo clone muke1908/strand-agent-studio
 gh repo clone mukeshbiswas_microsoft/strand-workflows
-cd strand-agent-studio
+Set-Location strand-workflows
 npm ci
-cp .env.example .env
+Set-Location ../strand-agent-studio
+npm ci
+Copy-Item .env.example .env
 ```
 
 Edit `.env` using **absolute paths on the Dev Box**, not paths from another machine:
 
 ```dotenv
-STRAND_WORKFLOWS_DIR=/home/YOUR_USER/src/strand-workflows
-STRAND_PATH_TSCALLING_WORKSPACE=/absolute/path/to/your/existing/TsCalling/checkout
-STRAND_PATH_WORKFLOW_DATA=/home/YOUR_USER/.local/share/strand/workflows
-STRAND_PATH_STUDIO_OUT=/home/YOUR_USER/.local/share/strand/output
-STRAND_PATH_NODE_BIN=/absolute/path/to/the/directory/containing/node
+STRAND_WORKFLOWS_DIR=C:/Users/YOUR_USER/src/strand-workflows
+STRAND_PATH_TSCALLING_WORKSPACE=C:/absolute/path/to/your/existing/TsCalling/checkout
+STRAND_PATH_WORKFLOW_DATA=C:/Users/YOUR_USER/strand-data/workflows
+STRAND_PATH_STUDIO_OUT=C:/Users/YOUR_USER/strand-data/output
+STRAND_PATH_NODE_BIN=C:/Program Files/nodejs
 ```
 
-Replace every placeholder; Node's env-file loader does not expand `$HOME` in these values. Find `NODE_BIN` with `node -p "require('node:path').dirname(process.execPath)"`. Prepare the existing TsCalling/Orient workspace separately; Strand does not provision it. Every configured directory must already exist and be accessible from the same Linux environment. If `copilot` is not on the host's PATH, also set `COPILOT_BIN` to its executable or JavaScript entry point.
+Replace every placeholder; Node's env-file loader does not expand `$HOME` in these values. Forward slashes work in Windows `.env` paths, including paths with spaces. Find `NODE_BIN` with `node -p "require('node:path').dirname(process.execPath)"`. Prepare the existing TsCalling/Orient workspace separately; Strand does not provision it. Every configured directory must already exist and be accessible from the Windows host. If `copilot` is not on PATH, set `COPILOT_BIN` to its executable, `.cmd` shim or JavaScript entry point. Workflow helper dependencies must be installed with `npm ci` in the workflow checkout.
+
+Windows supervision uses inbox Windows PowerShell and Windows Job Objects, not `ps` or POSIX signals. The host must permit PowerShell `Add-Type`/Win32 interop and job assignment; restrictive enterprise policies fail explicitly before launching the CLI. Keep Studio and workflow data in private user-owned directories with appropriate NTFS ACLs: POSIX `chmod` modes do not restrict Windows ACLs. Agents are told to use native paths and PowerShell syntax (including `&` before a quoted executable). macOS/Linux and WSL remain supported using their own native tools and paths; do not mix Windows and WSL installations or live state.
 
 ```sh
 npm run build
@@ -97,7 +103,7 @@ Operational workflows also need their external tools on this machine: authentica
 
 Git does **not** transfer `.env`, `.data`, credentials, MCP configuration, workflow runtime state, watches or run history. The Dev Box imports the committed workflow definitions, not unsaved/local builder edits from another host. Keep each machine's runtime state separate; do not point two hosts at the same live data directory.
 
-For later updates, stop Strand, pull both repositories with `git pull --ff-only`, run `npm ci` and `npm run build` in the Studio checkout, then run `npm run workflows:refresh` before restarting. Refresh protects conflicting local builder edits; resolve them explicitly rather than deleting the data directory.
+For later updates, stop Strand, pull both repositories with `git pull --ff-only`, run `npm ci` in both checkouts and `npm run build` in Studio, then run `npm run workflows:refresh` from Studio before restarting. Refresh protects conflicting local builder edits; resolve them explicitly rather than deleting the data directory.
 
 ## A quick tour
 
@@ -283,7 +289,7 @@ The supervisor keeps a stable process-group leader alive through CLI exit and te
 
 By default, workflow agents have file tools for their attempt output and configured shared folders, plus the built-in path lookup tool when named paths exist. Shell, external retrieval, delegated agents and publication tools remain restricted unless **Allow all tools** is enabled. Configured paths grant read/write access, not merely discovery. Use trusted folders: the CLI can load repository-local skills and agent configuration from them. Strand does not provide managed checkout lifecycles, universal side-effect receipts, or built-in Teams/PR publication; those belong to the configured workflows and external tools.
 
-CLI permissions and prompts are **not an OS sandbox**. Only run trusted instructions and locally authorized context; file-write tools remain available to create outputs. Do not expose this server publicly. Local host/origin checks are not authentication. Agent execution sends supplied context to the configured Copilot service. The supervisor currently requires POSIX process identity and process groups (macOS/Linux).
+CLI permissions and prompts are **not an OS sandbox**. Only run trusted instructions and locally authorized context; file-write tools remain available to create outputs. Do not expose this server publicly. Local host/origin checks are not authentication. Agent execution sends supplied context to the configured Copilot service. Supervision uses process creation identities and owned process groups on macOS/Linux, and identity-bound Job Objects with kill-on-close guardians on native Windows. Both verify descendant cleanup before accepting success or recovering owned workspaces.
 
 The host checks for due watches every five seconds. Ordinary provider evaluations are scheduled about a minute apart, with a two-minute delay after provider errors; check/action cycles use their configured recheck interval. The host admits at most two simultaneous workflow runs. Runs and AI result summaries have no wall-clock deadline; agents can keep working until they finish, fail, or are cancelled. Stop and host shutdown still cancel owned processes. A hung agent requires manual intervention; subprocess startup/cleanup and provider-request safety limits remain in place. Watcher lookup uses host code, not arbitrary user scripts.
 

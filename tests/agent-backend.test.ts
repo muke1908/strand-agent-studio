@@ -161,6 +161,76 @@ if (args.includes("--help")) {
   });
 }
 
+test(
+  "native Windows probes and executes a .cmd CLI with spaces and structured arguments",
+  {
+    skip: process.platform !== "win32",
+  },
+  async () => {
+    const root = temporaryRoot();
+    const directory = path.join(
+      root,
+      "CLI and workspace with spaces & symbols",
+    );
+    fs.mkdirSync(directory);
+    const script = path.join(directory, "copilot.js");
+    const shim = path.join(directory, "copilot.cmd");
+    const previous = process.env.COPILOT_BIN;
+    fs.writeFileSync(
+      script,
+      `
+    const fs = require("node:fs");
+    const args = process.argv.slice(2);
+    if (args.includes("--help")) {
+      console.log(${JSON.stringify([...commonOptions, "--no-remote-export", "--additional-mcp-config"].join(" "))});
+    } else {
+      fs.writeFileSync("args.json", JSON.stringify(args));
+      fs.writeFileSync("output.json", JSON.stringify({ summary: "Native Windows" }));
+    }
+  `,
+    );
+    fs.writeFileSync(shim, `@"${process.execPath}" "%~dp0copilot.js" %*\r\n`);
+    process.env.COPILOT_BIN = shim;
+    try {
+      const backend = copilotBackend();
+      assert.equal(backend.diagnostics().available, true);
+      assert.deepEqual(
+        await backend.execute(
+          {
+            directory,
+            prompt: 'Review "quoted" content & keep arguments literal.',
+            schema: { type: "object" },
+            purpose: "stage",
+            input: {},
+            allowedFolders: [directory],
+            paths: { CHECKOUT: directory },
+          },
+          new AbortController().signal,
+        ),
+        { summary: "Native Windows" },
+      );
+      const args = JSON.parse(
+        fs.readFileSync(path.join(directory, "args.json"), "utf8"),
+      );
+      assert.equal(args[args.indexOf("--add-dir") + 1], directory);
+      const config = JSON.parse(
+        args[args.indexOf("--additional-mcp-config") + 1],
+      );
+      assert.equal(config.mcpServers["strand-paths"].command, process.execPath);
+      assert.equal(
+        config.mcpServers["strand-paths"].args[1],
+        path.join(directory, "paths.json"),
+      );
+      const prompt = fs.readFileSync(path.join(directory, "prompt.md"), "utf8");
+      assert.match(prompt, /PowerShell-compatible/);
+    } finally {
+      if (previous === undefined) delete process.env.COPILOT_BIN;
+      else process.env.COPILOT_BIN = previous;
+      fs.rmSync(root, { recursive: true });
+    }
+  },
+);
+
 test("Copilot diagnostics reject missing required execution controls", () => {
   const root = temporaryRoot();
   const previous = process.env.COPILOT_BIN;

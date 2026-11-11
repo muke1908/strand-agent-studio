@@ -120,6 +120,14 @@ for (const outcome of ["completed", "blocked", "cancelled"] as const) {
       await host.close();
       assert.equal(final.status, outcome);
       assert(!fs.existsSync(workspace));
+      assert.deepEqual(
+        s
+          .git("worktree", "list", "--porcelain", "-z")
+          .split("\0")
+          .filter((field) => field.startsWith("worktree "))
+          .map((field) => path.resolve(field.slice("worktree ".length))),
+        [s.repository],
+      );
       assert.equal(
         s.git(
           "for-each-ref",
@@ -221,10 +229,10 @@ test("cleanup refuses a live attempt and a redirected workspace", async () => {
     assert.throws(() => cleanupRunWorktrees(s.store, run.id), /still active/);
     fs.unlinkSync(path.join(attempt, "wrapper.json"));
     s.git("worktree", "remove", "--force", workspace);
-    fs.symlinkSync(s.repository, workspace);
+    fs.symlinkSync(s.repository, workspace, "junction");
     assert.throws(() => cleanupRunWorktrees(s.store, run.id), /path changed/);
     fs.unlinkSync(workspace);
-    fs.symlinkSync(path.join(s.root, "missing"), workspace);
+    fs.symlinkSync(path.join(s.root, "missing"), workspace, "junction");
     assert.throws(() => cleanupRunWorktrees(s.store, run.id), /path changed/);
     assert.equal(s.git("status", "--porcelain"), s.ownerStatus);
   } finally {

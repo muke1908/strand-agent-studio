@@ -9,7 +9,9 @@ import {
   isGroupAlive,
   ownerSchema,
   processIdentity,
+  stopProcessGroup,
 } from "./process-owner.ts";
+import type { ProcessOwner } from "./process-owner.ts";
 import { groupWorkerFile, processRequestSchema } from "./process-group.ts";
 
 const exitSchema = z.object({
@@ -34,7 +36,7 @@ export function assertAttemptStopped(
     if (fs.existsSync(file)) {
       const owner = ownerSchema.parse(readJson(file));
       owners.push(owner);
-      if (isAlive(owner) || (name === "cli.json" && isGroupAlive(owner.pid)))
+      if (isAlive(owner) || (name === "cli.json" && isGroupAlive(owner)))
         throw new Error(
           "A previous agent process or process group is still active",
         );
@@ -91,10 +93,13 @@ export async function executeProcess(
   fs.closeSync(stdout);
   fs.closeSync(stderr);
   await new Promise<void>((resolve, reject) => {
-    const startup = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error("Agent supervisor did not become ready"));
-    }, 15000);
+    const startup = setTimeout(
+      () => {
+        child.kill("SIGKILL");
+        reject(new Error("Agent supervisor did not become ready"));
+      },
+      process.platform === "win32" ? 30000 : 15000,
+    );
     const stop = () => {
       if (child.connected) child.send({ type: "stop" });
     };
@@ -159,6 +164,7 @@ function worker(file: string): void {
     identity: processIdentity(process.pid),
   });
   let group: ReturnType<typeof fork> | undefined;
+  let groupOwner: ProcessOwner | undefined;
   let stopped = false;
   let finished = false;
   let registrationError: string | undefined;
@@ -170,10 +176,10 @@ function worker(file: string): void {
   ) {
     if (finished) return;
     finished = true;
-    if (group?.pid) {
+    if (groupOwner) {
       try {
         const deadline = Date.now() + 5000;
-        while (isGroupAlive(group.pid)) {
+        while (isGroupAlive(groupOwner)) {
           if (Date.now() >= deadline)
             throw new Error("Agent process group cleanup is unresolved");
           await new Promise((resolve) => setTimeout(resolve, 25));
@@ -203,7 +209,7 @@ function worker(file: string): void {
       const owner = ownerSchema.parse(
         readJson(path.join(request.directory, "cli.json")),
       );
-      if (isAlive(owner)) process.kill(-owner.pid, "SIGKILL");
+      stopProcessGroup(owner);
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ESRCH")
         return;
@@ -290,10 +296,11 @@ function worker(file: string): void {
     });
     if (group.pid) {
       try {
-        writeJson(path.join(request.directory, "cli.json"), {
+        groupOwner = {
           pid: group.pid,
           identity: processIdentity(group.pid),
-        });
+        };
+        writeJson(path.join(request.directory, "cli.json"), groupOwner);
       } catch (error) {
         registrationError =
           error instanceof Error ? error.message : String(error);

@@ -88,7 +88,11 @@ export function cleanupRunWorktrees(store: RunStore, id: string): void {
         throw new Error("Owned workspace path changed; refusing cleanup.");
       const registered = git("worktree", "list", "--porcelain", "-z")
         .split("\0")
-        .includes(`worktree ${expected}`);
+        .some(
+          (field) =>
+            field.startsWith("worktree ") &&
+            path.resolve(field.slice("worktree ".length)) === expected,
+        );
       if (registered) git("worktree", "remove", "--force", expected);
       else if (entry) {
         // The intent is registered before Git starts, so interrupted creation can leave a partial directory.

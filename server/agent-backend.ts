@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import spawn from "cross-spawn";
 import type { Json, Schema } from "../shared/contracts.ts";
 import { executeProcess } from "./process-runner.ts";
 import type { NamedPaths } from "./path-config.ts";
@@ -51,6 +51,9 @@ export function copilotBackend(): AgentBackend {
           path.join(os.homedir(), ".local/bin/copilot"),
           path.join(os.homedir(), ".config/agency/CurrentVersion/copilot"),
           path.join(os.homedir(), ".volta/bin/copilot"),
+          ...(process.platform === "win32" && process.env.APPDATA
+            ? [path.join(process.env.APPDATA, "npm", "copilot.cmd")]
+            : []),
           ...(fs.existsSync(nvm)
             ? fs
                 .readdirSync(nvm)
@@ -66,7 +69,7 @@ export function copilotBackend(): AgentBackend {
         : candidate;
       const command = resolved.endsWith(".js") ? process.execPath : candidate;
       const prefix = resolved.endsWith(".js") ? [candidate] : [];
-      const probe = spawnSync(
+      const probe = spawn.sync(
         command,
         [...prefix, "--no-auto-update", "--help"],
         {
@@ -154,6 +157,11 @@ export function copilotBackend(): AgentBackend {
             ? 'Report the actual task outcome, not just whether your session finished: "completed" when the requested task was accomplished, "blocked" when a prerequisite or external dependency prevented completion, or "failed" when the task was attempted but could not be completed. For blocked or failed tasks, use the corresponding schema-supported shape; otherwise write {"status":"blocked","summary":"<specific actionable error>"} or {"status":"failed","summary":"<specific actionable error>"} as a runtime failure envelope, even when the success schema is a primitive. Both stop the run without publishing a successful result. Never fabricate a schema-compliant success, including 0, to represent failure.'
             : "For blocked tasks, still write a schema-compliant result using only supported fields and status values.",
           "A final chat response or a separate audit receipt does not satisfy this contract.",
+          ...(process.platform === "win32"
+            ? [
+                "## Native Windows host\nUse native Windows paths and PowerShell-compatible commands, not WSL or POSIX-only utilities. Instruction examples may use POSIX notation: adapt the shell syntax without changing the operation or arguments. Invoke a quoted executable with PowerShell's & operator; NODE_BIN contains node.exe. Named paths are tool results, not shell environment variables.",
+              ]
+            : []),
           `${folderInstructions}${restrictions}`,
           ...(pathTools
             ? [

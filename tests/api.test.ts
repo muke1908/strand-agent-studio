@@ -844,7 +844,7 @@ test("completed run downloads contain only final results and reports, ignoring o
     );
 
     const link = path.join(attempt, "external-link");
-    fs.symlinkSync(reports, link);
+    fs.symlinkSync(reports, link, "junction");
     assert.equal((await assets(run.id)).status, 200);
     fs.unlinkSync(link);
     const large = path.join(directory, "large.json");
@@ -959,7 +959,7 @@ test("downloads include every final agent's nested file references without a rep
     fs.writeFileSync(report, "# Findings");
     fs.unlinkSync(nested);
     fs.rmdirSync(path.dirname(nested));
-    fs.symlinkSync(path.dirname(outside), path.dirname(nested));
+    fs.symlinkSync(path.dirname(outside), path.dirname(nested), "junction");
     fs.writeFileSync(
       path.join(path.dirname(outside), "findings.md"),
       "Outside",

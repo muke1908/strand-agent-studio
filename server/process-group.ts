@@ -1,7 +1,9 @@
-import { spawn } from "node:child_process";
+import spawn from "cross-spawn";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { readJson } from "./files.ts";
+import { processIdentity } from "./process-owner.ts";
+import { registerWindowsGroup } from "./windows-process.ts";
 
 export const groupWorkerFile = fileURLToPath(import.meta.url);
 export const processRequestSchema = z.object({
@@ -10,7 +12,7 @@ export const processRequestSchema = z.object({
   args: z.array(z.string()),
 });
 
-function groupWorker(file: string): void {
+async function groupWorker(file: string): Promise<void> {
   const request = processRequestSchema.parse(readJson(file));
   let started = false;
   let reported = false;
@@ -27,7 +29,10 @@ function groupWorker(file: string): void {
   }
   function stop() {
     try {
-      process.kill(-process.pid, "SIGKILL");
+      process.kill(
+        process.platform === "win32" ? process.pid : -process.pid,
+        "SIGKILL",
+      );
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ESRCH")
         return;
@@ -60,7 +65,23 @@ function groupWorker(file: string): void {
     cli.once("error", (error) => report(null, null, error.message));
     cli.once("exit", (code, signal) => report(code, signal));
   });
-  process.send?.({ type: "ready" });
+  if (process.platform === "win32") {
+    try {
+      await registerWindowsGroup({
+        pid: process.pid,
+        identity: processIdentity(process.pid),
+      });
+    } catch (error) {
+      console.error(error);
+      report(
+        null,
+        null,
+        error instanceof Error ? error.message : String(error),
+      );
+      return;
+    }
+  }
+  if (process.connected) process.send?.({ type: "ready" });
 }
 
-if (process.argv[2] === "--group-worker") groupWorker(process.argv[3]);
+if (process.argv[2] === "--group-worker") void groupWorker(process.argv[3]);

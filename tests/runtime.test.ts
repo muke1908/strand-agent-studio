@@ -1289,7 +1289,7 @@ test("failed agents block progression; resume uses pinned skills/input and accep
   const alias = path.join(root, "project-link");
   fs.mkdirSync(folder);
   fs.mkdirSync(otherFolder);
-  fs.symlinkSync(folder, alias);
+  fs.symlinkSync(folder, alias, "junction");
   const pinnedFolders = [fs.realpathSync(folder)];
   const alphaFolders = [fs.realpathSync(otherFolder)];
   const definition = workflow();
@@ -1361,7 +1361,7 @@ test("failed agents block progression; resume uses pinned skills/input and accep
       current.revision,
     );
     fs.unlinkSync(alias);
-    fs.symlinkSync(otherFolder, alias);
+    fs.symlinkSync(otherFolder, alias, "junction");
     fail = false;
     host.resume(run.id);
     const recovered = await waitForRun(() => host.store.get(run.id));
