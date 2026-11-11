@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import spawn from "cross-spawn";
+import { spawn } from "./native-spawn.ts";
 import type { Json, Schema } from "../shared/contracts.ts";
 import { executeProcess } from "./process-runner.ts";
 import type { NamedPaths } from "./path-config.ts";

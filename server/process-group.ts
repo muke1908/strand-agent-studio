@@ -1,4 +1,4 @@
-import spawn from "cross-spawn";
+import { spawn } from "./native-spawn.ts";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { readJson } from "./files.ts";

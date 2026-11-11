@@ -106,13 +106,19 @@ export function cleanupRunWorktrees(store: RunStore, id: string): void {
       const canonicalWorkspace = canonicalPath(expected);
       const registered = git("worktree", "list", "--porcelain", "-z")
         .split("\0")
-        .some(
+        .find(
           (field) =>
             field.startsWith("worktree ") &&
             canonicalPath(path.resolve(field.slice("worktree ".length))) ===
               canonicalWorkspace,
         );
-      if (registered) git("worktree", "remove", "--force", expected);
+      if (registered)
+        git(
+          "worktree",
+          "remove",
+          "--force",
+          registered.slice("worktree ".length),
+        );
       else if (entry) {
         // The intent is registered before Git starts, so interrupted creation can leave a partial directory.
         fs.rmSync(expected, { recursive: true, force: true });
