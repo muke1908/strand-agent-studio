@@ -27,6 +27,8 @@ test(
       JSON.stringify({ path: "C:\\source & folder\\", quoted: '"value"' }),
       "caret ^ and | pipe",
       "100% literal!",
+      "C:\\directory\\\\",
+      "",
     ];
     try {
       for (const command of [shim, "strand-echo", localShim]) {
@@ -37,7 +39,7 @@ test(
         });
         assert.ifError(result.error);
         assert.equal(result.status, 0, result.stderr);
-        assert.deepEqual(JSON.parse(result.stdout), args);
+        assert.deepEqual(JSON.parse(result.stdout), args, command);
       }
     } finally {
       fs.rmSync(root, { recursive: true, force: true });

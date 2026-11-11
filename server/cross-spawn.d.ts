@@ -10,7 +10,6 @@ declare module "cross-spawn/lib/parse.js" {
 declare module "cross-spawn/lib/util/escape.js" {
   const escape: {
     command(arg: string): string;
-    argument(arg: string, doubleEscapeMetaChars: boolean): string;
   };
   export default escape;
 }
