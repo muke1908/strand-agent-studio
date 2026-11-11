@@ -223,6 +223,12 @@ test(
       );
       const prompt = fs.readFileSync(path.join(directory, "prompt.md"), "utf8");
       assert.match(prompt, /PowerShell-compatible/);
+    } catch (error) {
+      const stderr = path.join(directory, "stderr.log");
+      throw new Error(
+        `${String(error)}\n${fs.existsSync(stderr) ? fs.readFileSync(stderr, "utf8") : "CLI did not start."}`,
+        { cause: error },
+      );
     } finally {
       if (previous === undefined) delete process.env.COPILOT_BIN;
       else process.env.COPILOT_BIN = previous;

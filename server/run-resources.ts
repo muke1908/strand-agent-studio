@@ -17,6 +17,23 @@ const resourceSchema = z
   })
   .strict();
 
+function canonicalPath(directory: string): string {
+  try {
+    return fs.realpathSync.native(directory);
+  } catch (error) {
+    if (
+      !(error instanceof Error && "code" in error && error.code === "ENOENT") ||
+      path.dirname(directory) === directory
+    )
+      throw error;
+    // Git keeps registrations after a workspace or its parents disappear.
+    return path.join(
+      canonicalPath(path.dirname(directory)),
+      path.basename(directory),
+    );
+  }
+}
+
 export function cleanupRunWorktrees(store: RunStore, id: string): void {
   const attempts = path.join(store.directory(id), "attempts");
   if (!fs.existsSync(attempts)) return;
@@ -75,8 +92,8 @@ export function cleanupRunWorktrees(store: RunStore, id: string): void {
         encoding: "utf8",
       });
     if (
-      fs.realpathSync(git("rev-parse", "--show-toplevel").trim()) !==
-      resource.repository
+      fs.realpathSync.native(git("rev-parse", "--show-toplevel").trim()) !==
+      fs.realpathSync.native(resource.repository)
     )
       throw new Error("Owned worktree repository is not the pinned Git root.");
     if (!removed.has(expected)) {
@@ -86,12 +103,14 @@ export function cleanupRunWorktrees(store: RunStore, id: string): void {
         (!entry.isDirectory() || fs.realpathSync(expected) !== expected)
       )
         throw new Error("Owned workspace path changed; refusing cleanup.");
+      const canonicalWorkspace = canonicalPath(expected);
       const registered = git("worktree", "list", "--porcelain", "-z")
         .split("\0")
         .some(
           (field) =>
             field.startsWith("worktree ") &&
-            path.resolve(field.slice("worktree ".length)) === expected,
+            canonicalPath(path.resolve(field.slice("worktree ".length))) ===
+              canonicalWorkspace,
         );
       if (registered) git("worktree", "remove", "--force", expected);
       else if (entry) {

@@ -118,15 +118,17 @@ for (const outcome of ["completed", "blocked", "cancelled"] as const) {
       if (outcome === "cancelled") host.stop(run.id);
       const final = await waitForRun(() => host.store.get(run.id));
       await host.close();
-      assert.equal(final.status, outcome);
+      assert.equal(final.status, outcome, final.error);
       assert(!fs.existsSync(workspace));
       assert.deepEqual(
         s
           .git("worktree", "list", "--porcelain", "-z")
           .split("\0")
           .filter((field) => field.startsWith("worktree "))
-          .map((field) => path.resolve(field.slice("worktree ".length))),
-        [s.repository],
+          .map((field) =>
+            fs.realpathSync.native(field.slice("worktree ".length)),
+          ),
+        [fs.realpathSync.native(s.repository)],
       );
       assert.equal(
         s.git(
@@ -259,9 +261,18 @@ test("cleanup removes Git registration even when the owned directory disappeared
     const attempt = path.join(s.store.directory(run.id), "attempts", "prepare");
     fs.mkdirSync(attempt, { recursive: true });
     const workspace = s.register(attempt, run.id);
-    fs.rmSync(workspace, { recursive: true });
+    fs.rmSync(path.dirname(workspace), { recursive: true });
     cleanupRunWorktrees(s.store, run.id);
-    assert(!s.git("worktree", "list", "--porcelain").includes(workspace));
+    assert.deepEqual(
+      s
+        .git("worktree", "list", "--porcelain", "-z")
+        .split("\0")
+        .filter((field) => field.startsWith("worktree "))
+        .map((field) =>
+          fs.realpathSync.native(field.slice("worktree ".length)),
+        ),
+      [fs.realpathSync.native(s.repository)],
+    );
     assert.equal(
       s.git(
         "for-each-ref",

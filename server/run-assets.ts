@@ -155,12 +155,15 @@ export function runAssets(store: RunStore, id: string): Uint8Array {
         if (folderIndex < 0)
           fail("Output asset is outside this agent's pinned allowed folders.");
         if (included.has(resolved)) continue;
-        const relative = path.relative(folders[folderIndex], resolved);
+        const relative = path
+          .relative(folders[folderIndex], resolved)
+          .split(path.sep)
+          .join("/");
         if (relative.includes("\\"))
           fail(`Unsupported asset filename: ${relative}`);
         add(
           file,
-          `outputs/${stage.id}-${agent.id}/${folderIndex + 1}/${relative.split(path.sep).join("/")}`,
+          `outputs/${stage.id}-${agent.id}/${folderIndex + 1}/${relative}`,
         );
         included.add(resolved);
       }
